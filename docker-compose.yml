@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-consumables}
+      POSTGRES_USER: ${POSTGRES_USER:-consumables}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-consumables}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ./backend
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-dev-secret-change-me}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://consumables:consumables@db:5432/consumables}
+      ALLOW_INSECURE_MQTT_TLS: ${ALLOW_INSECURE_MQTT_TLS:-true}
+      AGENT_DEBUG_LOG_PATH: /logs/debug.log
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./.cursor:/logs
+
+  collector:
+    build:
+      context: ./collector
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-dev-secret-change-me}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://consumables:consumables@db:5432/consumables}
+      ALLOW_INSECURE_MQTT_TLS: ${ALLOW_INSECURE_MQTT_TLS:-true}
+      AGENT_DEBUG_LOG_PATH: /logs/debug.log
+    depends_on:
+      - db
+    volumes:
+      - ./.cursor:/logs
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+volumes:
+  db_data:
+
+
