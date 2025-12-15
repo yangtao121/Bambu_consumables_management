@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlparse
 from logging.config import fileConfig
 
@@ -11,6 +12,11 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
+
+# Ensure project root is on sys.path so `import app.*` works in all runtimes (Docker/Alembic/CWD variations).
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from app.db.base import Base
 from app.db import models  # noqa: F401
