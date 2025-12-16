@@ -8,7 +8,7 @@ import { cn } from "../lib/utils";
 const NAV = [
   { href: "/", label: "Dashboard" },
   { href: "/printers", label: "Printers" },
-  { href: "/spools", label: "Spools" },
+  { href: "/stocks", label: "库存" },
   { href: "/jobs", label: "Jobs" },
   { href: "/reports", label: "Reports" },
   { href: "/settings", label: "Settings" }

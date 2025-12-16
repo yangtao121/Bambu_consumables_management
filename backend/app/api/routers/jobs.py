@@ -9,10 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.db.models.consumption_record import ConsumptionRecord
+from app.db.models.material_stock import MaterialStock
 from app.db.models.print_job import PrintJob
 from app.db.models.spool import Spool
-from app.schemas.job import JobConsumptionOut, JobOut, ManualConsumptionCreate
-from app.services.spool_service import recalc_spool_remaining
+from app.schemas.job import JobConsumptionOut, JobMaterialResolve, JobOut, ManualConsumptionCreate
+from app.services.stock_service import apply_stock_delta
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -48,23 +49,29 @@ async def list_job_consumptions(job_id: UUID, db: AsyncSession = Depends(get_db)
 
     rows = (
         await db.execute(
-            select(ConsumptionRecord, Spool)
-            .join(Spool, Spool.id == ConsumptionRecord.spool_id)
+            select(ConsumptionRecord, Spool, MaterialStock)
+            .outerjoin(Spool, Spool.id == ConsumptionRecord.spool_id)
+            .outerjoin(MaterialStock, MaterialStock.id == ConsumptionRecord.stock_id)
             .where(ConsumptionRecord.job_id == job_id)
             .order_by(ConsumptionRecord.created_at.asc())
         )
     ).all()
 
     out: list[JobConsumptionOut] = []
-    for c, s in rows:
+    for c, s, st in rows:
         out.append(
             JobConsumptionOut(
                 id=c.id,
                 job_id=c.job_id,
-                spool_id=c.spool_id,
-                spool_name=s.name,
-                spool_material=s.material,
-                spool_color=s.color,
+                tray_id=getattr(c, "tray_id", None),
+                stock_id=getattr(c, "stock_id", None),
+                material=(st.material if st else (s.material if s else None)),
+                color=(st.color if st else (s.color if s else None)),
+                brand=(st.brand if st else (s.brand if s else None)),
+                spool_id=(c.spool_id if getattr(c, "spool_id", None) else None),
+                spool_name=(s.name if s else None),
+                spool_material=(s.material if s else None),
+                spool_color=(s.color if s else None),
                 grams=int(c.grams),
                 source=c.source,
                 confidence=c.confidence,
@@ -79,12 +86,15 @@ async def add_manual_consumption(job_id: UUID, body: ManualConsumptionCreate, db
     j = await db.get(PrintJob, job_id)
     if not j:
         raise HTTPException(status_code=404, detail="job not found")
-    if not await db.get(Spool, body.spool_id):
-        raise HTTPException(status_code=404, detail="spool not found")
+    st = await db.get(MaterialStock, body.stock_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="stock not found")
 
     c = ConsumptionRecord(
         job_id=job_id,
-        spool_id=body.spool_id,
+        spool_id=None,
+        stock_id=body.stock_id,
+        tray_id=None,
         grams=body.grams,
         source="manual",
         confidence="high",
@@ -92,8 +102,129 @@ async def add_manual_consumption(job_id: UUID, body: ManualConsumptionCreate, db
     )
     db.add(c)
     await db.flush()
-    await recalc_spool_remaining(db, body.spool_id)
+    await apply_stock_delta(
+        db,
+        body.stock_id,
+        -int(body.grams),
+        reason=f"manual job={job_id} note={body.note or ''}",
+        job_id=job_id,
+    )
     await db.commit()
     return {"ok": True, "consumption_id": str(c.id), "note": body.note}
+
+
+@router.post("/{job_id}/materials/resolve")
+async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: AsyncSession = Depends(get_db)) -> dict:
+    j = await db.get(PrintJob, job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    snap = j.spool_binding_snapshot_json or {}
+    pending = snap.get("pending_consumptions") if isinstance(snap.get("pending_consumptions"), list) else []
+    if not pending:
+        return {"ok": True, "resolved": 0, "note": "no pending consumptions"}
+
+    tray_to_stock = snap.get("tray_to_stock") if isinstance(snap.get("tray_to_stock"), dict) else {}
+
+    resolved_count = 0
+    remaining_pending: list[dict] = []
+
+    # Build quick lookup mapping tray -> stock_id (from request)
+    req_map: dict[int, UUID] = {}
+    for it in body.items or []:
+        req_map[int(it.tray_id)] = it.stock_id
+
+    for entry in pending:
+        if not isinstance(entry, dict):
+            continue
+        tray_id = entry.get("tray_id")
+        try:
+            tray_id_int = int(tray_id)
+        except Exception:
+            remaining_pending.append(entry)
+            continue
+
+        stock_id = req_map.get(tray_id_int)
+        if not stock_id:
+            remaining_pending.append(entry)
+            continue
+
+        st = await db.get(MaterialStock, stock_id)
+        if not st:
+            remaining_pending.append(entry)
+            continue
+
+        unit = entry.get("unit")
+        grams = 0
+        if unit == "grams":
+            try:
+                grams = int(entry.get("grams") or 0)
+            except Exception:
+                grams = 0
+        elif unit == "pct":
+            try:
+                pct_delta = float(entry.get("pct_delta") or 0.0)
+            except Exception:
+                pct_delta = 0.0
+            grams = int(round((pct_delta / 100.0) * float(st.roll_weight_grams)))
+
+        if grams <= 0:
+            # nothing to settle; drop it
+            resolved_count += 1
+            continue
+
+        # Idempotent: same job+tray+stock only once
+        exists = await db.scalar(
+            select(ConsumptionRecord.id).where(
+                ConsumptionRecord.job_id == job_id,
+                ConsumptionRecord.stock_id == stock_id,
+                ConsumptionRecord.tray_id == tray_id_int,
+            )
+        )
+        if exists:
+            resolved_count += 1
+            continue
+
+        await apply_stock_delta(
+            db,
+            stock_id,
+            -int(grams),
+            reason=f"resolve job={job_id} tray={tray_id_int} source={entry.get('source')}",
+            job_id=job_id,
+        )
+
+        c = ConsumptionRecord(
+            job_id=job_id,
+            spool_id=None,
+            stock_id=stock_id,
+            tray_id=tray_id_int,
+            grams=int(grams),
+            source=str(entry.get("source") or "resolved_pending"),
+            confidence=str(entry.get("confidence") or "low"),
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(c)
+        await db.flush()
+
+        tray_to_stock[str(tray_id_int)] = str(stock_id)
+        resolved_count += 1
+
+    # Update snapshot
+    snap2 = dict(snap)
+    snap2["pending_consumptions"] = remaining_pending
+    pending_set: set[int] = set()
+    for e in remaining_pending:
+        if isinstance(e, dict) and "tray_id" in e:
+            try:
+                pending_set.add(int(e["tray_id"]))
+            except Exception:
+                pass
+    snap2["pending_trays"] = sorted(pending_set)
+    snap2["tray_to_stock"] = tray_to_stock
+    j.spool_binding_snapshot_json = snap2
+    j.updated_at = datetime.now(timezone.utc)
+
+    await db.commit()
+    return {"ok": True, "resolved": resolved_count, "remaining_pending": len(remaining_pending)}
 
 

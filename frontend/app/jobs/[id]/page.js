@@ -31,7 +31,7 @@ function statusVariant(st) {
 }
 
 const manualSchema = z.object({
-  spool_id: z.string().min(1, "请选择耗材卷"),
+  stock_id: z.string().min(1, "请选择库存项"),
   grams: z.coerce.number().int().min(0, "克数必须 >= 0"),
   note: z.string().trim().optional()
 });
@@ -40,23 +40,25 @@ export default function Page({ params }) {
   const jobId = params?.id;
   const [job, setJob] = useState(null);
   const [cons, setCons] = useState([]);
-  const [spools, setSpools] = useState([]);
+  const [stocks, setStocks] = useState([]);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
+  const [resolveMap, setResolveMap] = useState({});
 
   const form = useForm({
     resolver: zodResolver(manualSchema),
-    defaultValues: { spool_id: "", grams: 0, note: "" }
+    defaultValues: { stock_id: "", grams: 0, note: "" }
   });
 
   async function reload() {
     if (!jobId) return;
     setLoading(true);
     try {
-      const [j, c, s] = await Promise.all([fetchJson(`/jobs/${jobId}`), fetchJson(`/jobs/${jobId}/consumptions`), fetchJson("/spools")]);
+      const [j, c, s] = await Promise.all([fetchJson(`/jobs/${jobId}`), fetchJson(`/jobs/${jobId}/consumptions`), fetchJson("/stocks")]);
       setJob(j);
       setCons(Array.isArray(c) ? c : []);
-      setSpools(Array.isArray(s) ? s : []);
+      setStocks(Array.isArray(s) ? s : []);
+      setResolveMap({});
     } finally {
       setLoading(false);
     }
@@ -72,14 +74,56 @@ export default function Page({ params }) {
     await fetchJson(`/jobs/${jobId}/consumptions`, {
       method: "POST",
       body: JSON.stringify({
-        spool_id: values.spool_id,
+        stock_id: values.stock_id,
         grams: Number(values.grams),
         note: values.note ? values.note : null
       })
     });
     toast.success("已补录扣料");
     setOpen(false);
-    form.reset({ spool_id: "", grams: 0, note: "" });
+    form.reset({ stock_id: "", grams: 0, note: "" });
+    await reload();
+  }
+
+  const pending = useMemo(() => {
+    const p = job?.spool_binding_snapshot_json?.pending_consumptions;
+    return Array.isArray(p) ? p.filter((x) => x && typeof x === "object") : [];
+  }, [job]);
+
+  const pendingTrays = useMemo(() => {
+    const s = new Set();
+    for (const e of pending) {
+      const tid = e.tray_id;
+      const n = Number(tid);
+      if (Number.isFinite(n)) s.add(String(Math.trunc(n)));
+    }
+    return Array.from(s.values()).sort((a, b) => Number(a) - Number(b));
+  }, [pending]);
+
+  function candidatesFor(entry) {
+    const material = entry?.material;
+    const color = entry?.color;
+    const isOfficial = Boolean(entry?.is_official);
+    return stocks.filter(
+      (s) => s.material === material && s.color === color && (isOfficial ? s.brand === "官方" : s.brand !== "官方")
+    );
+  }
+
+  async function resolvePending() {
+    const items = [];
+    for (const trayId of pendingTrays) {
+      const stockId = resolveMap[trayId];
+      if (!stockId) {
+        toast.error(`请为 Tray ${trayId} 选择库存项`);
+        return;
+      }
+      items.push({ tray_id: Number(trayId), stock_id: stockId });
+    }
+    await fetchJson(`/jobs/${jobId}/materials/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ items })
+    });
+    toast.success("已归因并结算扣料");
     await reload();
   }
 
@@ -151,6 +195,48 @@ export default function Page({ params }) {
           <CardDescription>source/confidence 会告诉你这条记录来自自动结算还是手工补录。</CardDescription>
         </CardHeader>
         <CardContent>
+          {pendingTrays.length > 0 ? (
+            <div className="mb-4 rounded-md border bg-muted/20 p-4">
+              <div className="font-medium">待归因扣料</div>
+              <div className="mt-1 text-sm text-muted-foreground">
+                该作业有无法唯一匹配品牌的托盘消耗，请为每个 Tray 选择要扣减的「库存项」后结算。
+              </div>
+              <div className="mt-3 grid gap-3">
+                {pendingTrays.map((trayId) => {
+                  const entry = pending.find((e) => String(e.tray_id) === String(trayId)) || null;
+                  const opts = entry ? candidatesFor(entry) : [];
+                  return (
+                    <div key={trayId} className="grid grid-cols-1 gap-2 md:grid-cols-12 md:items-center">
+                      <div className="md:col-span-2 font-medium">Tray {trayId}</div>
+                      <div className="md:col-span-4 text-sm text-muted-foreground">
+                        {entry ? `${entry.material || "-"} · ${entry.color || "-"} ${entry.is_official ? "（官方）" : ""}` : "-"}
+                        {entry?.unit === "pct" && entry?.pct_delta != null ? ` · 消耗 ${Number(entry.pct_delta).toFixed(1)}%` : ""}
+                        {entry?.unit === "grams" && entry?.grams != null ? ` · 消耗 ${entry.grams}g` : ""}
+                      </div>
+                      <div className="md:col-span-6">
+                        <select
+                          className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                          value={resolveMap[trayId] || ""}
+                          onChange={(e) => setResolveMap((prev) => ({ ...prev, [trayId]: e.target.value }))}
+                        >
+                          <option value="">选择库存项…</option>
+                          {(opts.length ? opts : stocks).map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {s.material}/{s.color}/{s.brand} - {s.remaining_grams}g
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-3">
+                <Button onClick={resolvePending}>提交归因并结算</Button>
+              </div>
+            </div>
+          ) : null}
+
           <div className="overflow-auto rounded-md border">
             <table className="w-full text-sm">
               <thead className="bg-muted/50">
@@ -167,12 +253,27 @@ export default function Page({ params }) {
                   <tr key={c.id} className="border-t">
                     <td className="px-3 py-2">{fmtTime(c.created_at)}</td>
                     <td className="px-3 py-2">
-                      <Link className="font-medium hover:underline" href={`/spools/${c.spool_id}`}>
-                        {c.spool_name}
-                      </Link>
-                      <div className="text-xs text-muted-foreground">
-                        {c.spool_material} · {c.spool_color}
-                      </div>
+                      {c.stock_id ? (
+                        <>
+                          <Link className="font-medium hover:underline" href={`/stocks/${c.stock_id}`}>
+                            {c.material} · {c.color} · {c.brand}
+                          </Link>
+                          <div className="text-xs text-muted-foreground">
+                            {c.tray_id != null ? `Tray ${c.tray_id}` : "-"}
+                          </div>
+                        </>
+                      ) : c.spool_id ? (
+                        <>
+                          <Link className="font-medium hover:underline" href={`/spools/${c.spool_id}`}>
+                            {c.spool_name || "Spool"}
+                          </Link>
+                          <div className="text-xs text-muted-foreground">
+                            {c.spool_material} · {c.spool_color}
+                          </div>
+                        </>
+                      ) : (
+                        <span className="text-muted-foreground">-</span>
+                      )}
                     </td>
                     <td className="px-3 py-2 font-medium">{c.grams}</td>
                     <td className="px-3 py-2">{c.source}</td>
@@ -209,16 +310,16 @@ export default function Page({ params }) {
             })}
           >
             <div className="grid gap-2">
-              <Label>耗材卷</Label>
-              <select className="h-9 rounded-md border border-input bg-background px-3 text-sm" {...form.register("spool_id")}>
+              <Label>库存项</Label>
+              <select className="h-9 rounded-md border border-input bg-background px-3 text-sm" {...form.register("stock_id")}>
                 <option value="">请选择…</option>
-                {spools.map((s) => (
+                {stocks.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.name} ({s.material}/{s.color}) - {s.remaining_grams_est}g
+                    {s.material}/{s.color}/{s.brand} - {s.remaining_grams}g
                   </option>
                 ))}
               </select>
-              {form.formState.errors.spool_id ? <div className="text-xs text-destructive">{form.formState.errors.spool_id.message}</div> : null}
+              {form.formState.errors.stock_id ? <div className="text-xs text-destructive">{form.formState.errors.stock_id.message}</div> : null}
             </div>
             <div className="grid gap-2">
               <Label>克数</Label>

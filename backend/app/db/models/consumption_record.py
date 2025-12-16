@@ -15,7 +15,13 @@ class ConsumptionRecord(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("print_jobs.id", ondelete="CASCADE"), nullable=False)
-    spool_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("spools.id", ondelete="RESTRICT"), nullable=False)
+    # legacy (spool-mode)
+    spool_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("spools.id", ondelete="RESTRICT"), nullable=True)
+    # new (stock-mode)
+    stock_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("material_stocks.id", ondelete="RESTRICT"), nullable=True
+    )
+    tray_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     grams: Mapped[int] = mapped_column(Integer, nullable=False)
     source: Mapped[str] = mapped_column(Text, nullable=False)
@@ -25,5 +31,7 @@ class ConsumptionRecord(Base):
 
 Index("ix_consumption_records_job_id", ConsumptionRecord.job_id)
 Index("ix_consumption_records_spool_id", ConsumptionRecord.spool_id)
+Index("ix_consumption_records_stock_id", ConsumptionRecord.stock_id)
+Index("ix_consumption_records_job_tray", ConsumptionRecord.job_id, ConsumptionRecord.tray_id)
 
 

@@ -123,7 +123,7 @@ export default function Page() {
             <Link href="/printers">去打印机</Link>
           </Button>
           <Button asChild variant="outline">
-            <Link href="/spools">去耗材</Link>
+            <Link href="/stocks">去库存</Link>
           </Button>
           <Button asChild variant="outline">
             <Link href="/jobs">去历史</Link>

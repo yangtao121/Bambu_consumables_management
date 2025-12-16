@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
@@ -50,29 +50,13 @@ const printerSchema = z.object({
 export default function Page() {
   const [items, setItems] = useState([]);
   const [reportsById, setReportsById] = useState({});
-  const [spools, setSpools] = useState([]);
-  const [mappings, setMappings] = useState([]);
+  const [stocks, setStocks] = useState([]);
   const [loading, setLoading] = useState(false);
 
   const printerIdsKey = items
     .map((p) => p && p.id)
     .filter(Boolean)
     .join("|");
-
-  const spoolsById = useMemo(() => {
-    const m = new Map();
-    for (const s of spools) m.set(String(s.id), s);
-    return m;
-  }, [spools]);
-
-  const mappingByKey = useMemo(() => {
-    // key: `${printer_id}:${tray_id}` -> mapping
-    const m = new Map();
-    for (const r of mappings) {
-      m.set(`${r.printer_id}:${r.tray_id}`, r);
-    }
-    return m;
-  }, [mappings]);
 
   async function reload() {
     try {
@@ -84,11 +68,10 @@ export default function Page() {
     }
   }
 
-  async function reloadSpoolsAndMappings() {
+  async function reloadStocks() {
     try {
-      const [s, m] = await Promise.all([fetchJson("/spools"), fetchJson("/tray-mappings?active_only=true")]);
-      setSpools(Array.isArray(s) ? s : []);
-      setMappings(Array.isArray(m) ? m : []);
+      const s = await fetchJson("/stocks");
+      setStocks(Array.isArray(s) ? s : []);
     } catch (e) {
       toast.error(String(e?.message || e));
     }
@@ -96,7 +79,7 @@ export default function Page() {
 
   useEffect(() => {
     reload();
-    reloadSpoolsAndMappings();
+    reloadStocks();
 
     // Realtime updates via SSE
     const url = `${apiBaseUrl()}/realtime/printers`;
@@ -199,22 +182,25 @@ export default function Page() {
     await reload();
   }
 
-  async function bind(printerId, trayId, spoolId) {
-    await fetchJson("/tray-mappings", {
-      method: "POST",
-      body: JSON.stringify({ printer_id: printerId, tray_id: Number(trayId), spool_id: spoolId })
-    });
-    toast.success(`已绑定 Tray ${trayId}`);
-    await reloadSpoolsAndMappings();
+  function normalizeRemainPct(v) {
+    if (v == null) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return null;
+    if (n <= 1) return n * 100; // fraction -> percent
+    if (n <= 100) return n;
+    return null; // unknown unit
   }
 
-  async function unbind(printerId, trayId) {
-    await fetchJson("/tray-mappings/unbind", {
-      method: "POST",
-      body: JSON.stringify({ printer_id: printerId, tray_id: Number(trayId) })
-    });
-    toast.success(`已解绑 Tray ${trayId}`);
-    await reloadSpoolsAndMappings();
+  function isOfficialTray(t) {
+    if (!t || typeof t !== "object") return false;
+    const tag = t.tag_uid;
+    const uuid = t.tray_uuid;
+    const name = t.tray_id_name;
+    if (typeof tag === "number" && tag > 0) return true;
+    if (typeof tag === "string" && tag.trim() && tag.trim() !== "0") return true;
+    if (typeof uuid === "string" && uuid.trim()) return true;
+    if (typeof name === "string" && name.trim()) return true;
+    return false;
   }
 
   return (
@@ -222,14 +208,16 @@ export default function Page() {
       <div className="flex items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Printers</h1>
-          <p className="text-sm text-muted-foreground">添加/查看打印机，并在托盘上绑定耗材卷（tray → spool）。</p>
+          <p className="text-sm text-muted-foreground">
+            添加/查看打印机。耗材不再按“具体卷”绑定托盘，而是按「材质+颜色+品牌」的库存项扣减；第三方品牌读不到时会在作业里提示归因。
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" onClick={reload} disabled={loading}>
             {loading ? "加载中…" : "刷新"}
           </Button>
-          <Button variant="outline" onClick={reloadSpoolsAndMappings}>
-            刷新耗材/绑定
+          <Button variant="outline" onClick={reloadStocks}>
+            刷新库存
           </Button>
         </div>
       </div>
@@ -297,6 +285,20 @@ export default function Page() {
           const trayNow = ev?.tray_now ?? null;
           const trays = Array.isArray(ev?.ams_trays) ? ev.ams_trays : [];
           const occurredAt = rep?.occurred_at || null;
+          const currentTray =
+            trayNow == null || trayNow === 255 ? null : trays.find((t) => Number(t?.id) === Number(trayNow)) || null;
+          const currentMaterial = currentTray?.type || "-";
+          const currentColor = currentTray?.color || "-";
+          const currentOfficial = currentTray ? isOfficialTray(currentTray) : false;
+          const currentCandidates = currentTray
+            ? stocks.filter(
+                (s) =>
+                  s.material === currentMaterial &&
+                  s.color === currentColor &&
+                  (currentOfficial ? s.brand === "官方" : s.brand !== "官方")
+              )
+            : [];
+          const currentStock = currentCandidates.length === 1 ? currentCandidates[0] : null;
 
           return (
             <Card key={p.id}>
@@ -317,22 +319,27 @@ export default function Page() {
                     <div className="text-muted-foreground">{taskId ? `${taskId}` : "-"} {taskName ? `· ${taskName}` : ""}</div>
                     <div className="text-muted-foreground">上报：{fmtTime(occurredAt)}</div>
                     <div className="text-muted-foreground">当前托盘：{trayNow == null || trayNow === 255 ? "-" : `Tray ${trayNow}`}</div>
+                    <div className="text-muted-foreground">
+                      当前耗材：{currentTray ? `${currentMaterial} · ${currentColor}${currentOfficial ? "（官方）" : ""}` : "-"}
+                    </div>
+                    <div className="text-muted-foreground">
+                      扣减库存：{currentStock ? `${currentStock.brand}（剩余 ${currentStock.remaining_grams}g）` : currentTray ? (currentCandidates.length > 1 ? "多品牌冲突（打印后归因）" : "未匹配库存项") : "-"}
+                    </div>
                   </div>
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
-                <div className="text-sm text-muted-foreground">
-                  托盘绑定：选择一个耗材卷绑定到对应 tray；标记用完会自动解绑（Spools 页已实现）。
-                </div>
+                <div className="text-sm text-muted-foreground">AMS 托盘信息（材质/颜色/剩余）。系统会尝试匹配到唯一库存项；匹配不到会在作业里提示归因。</div>
                 <div className="overflow-auto rounded-md border">
                   <table className="w-full text-sm">
                     <thead className="bg-muted/50">
                       <tr className="text-left">
                         <th className="px-3 py-2">Tray</th>
+                        <th className="px-3 py-2">材质</th>
+                        <th className="px-3 py-2">颜色</th>
                         <th className="px-3 py-2">remain(%)</th>
-                        <th className="px-3 py-2">已绑定耗材</th>
-                        <th className="px-3 py-2">绑定操作</th>
-                        <th className="px-3 py-2 text-right">解绑</th>
+                        <th className="px-3 py-2">来源</th>
+                        <th className="px-3 py-2">库存匹配</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -340,69 +347,40 @@ export default function Page() {
                         const trayId = t?.id;
                         if (trayId == null) return null;
                         const key = `${p.id}:${trayId}`;
-                        const m = mappingByKey.get(key);
-                        const boundSpool = m ? spoolsById.get(String(m.spool_id)) : null;
+                        const isActiveTray = trayNow != null && trayNow !== 255 && Number(trayNow) === Number(trayId);
+                        const pct = normalizeRemainPct(t?.remain);
+                        const material = t?.type || "-";
+                        const color = t?.color || "-";
+                        const official = isOfficialTray(t);
+                        const candidates = stocks.filter(
+                          (s) =>
+                            s.material === material &&
+                            s.color === color &&
+                            (official ? s.brand === "官方" : s.brand !== "官方")
+                        );
+                        const matched = candidates.length === 1 ? candidates[0] : null;
+                        const matchText =
+                          matched
+                            ? `${matched.brand}（剩余 ${matched.remaining_grams}g）`
+                            : candidates.length > 1
+                              ? `多品牌冲突：${candidates.map((c) => c.brand).join(" / ")}（打印后归因）`
+                              : "未匹配（去库存新增）";
                         return (
-                          <tr key={key} className="border-t">
-                            <td className="px-3 py-2 font-medium">Tray {trayId}</td>
-                            <td className="px-3 py-2">{t?.remain == null ? "-" : t.remain}</td>
-                            <td className="px-3 py-2">
-                              {boundSpool ? (
-                                <div className="flex flex-col">
-                                  <span className="font-medium">{boundSpool.name}</span>
-                                  <span className="text-xs text-muted-foreground">
-                                    {boundSpool.material} · {boundSpool.color} · 剩余 {boundSpool.remaining_grams_est}g
-                                  </span>
-                                </div>
-                              ) : (
-                                <span className="text-muted-foreground">未绑定</span>
-                              )}
+                          <tr key={key} className={`border-t ${isActiveTray ? "bg-accent/30" : ""}`}>
+                            <td className="px-3 py-2 font-medium">
+                              Tray {trayId} {isActiveTray ? <span className="ml-2 text-xs text-muted-foreground">(正在使用)</span> : null}
                             </td>
-                            <td className="px-3 py-2">
-                              <select
-                                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
-                                defaultValue=""
-                                onChange={async (e) => {
-                                  const spoolId = e.target.value;
-                                  if (!spoolId) return;
-                                  e.target.value = "";
-                                  try {
-                                    await bind(p.id, trayId, spoolId);
-                                  } catch (err) {
-                                    toast.error(String(err?.message || err));
-                                  }
-                                }}
-                              >
-                                <option value="">选择耗材卷…</option>
-                                {spools.map((s) => (
-                                  <option key={s.id} value={s.id}>
-                                    {s.name} ({s.material}/{s.color}) - {s.remaining_grams_est}g
-                                  </option>
-                                ))}
-                              </select>
-                            </td>
-                            <td className="px-3 py-2 text-right">
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                disabled={!m}
-                                onClick={async () => {
-                                  try {
-                                    await unbind(p.id, trayId);
-                                  } catch (err) {
-                                    toast.error(String(err?.message || err));
-                                  }
-                                }}
-                              >
-                                解绑
-                              </Button>
-                            </td>
+                            <td className="px-3 py-2">{material}</td>
+                            <td className="px-3 py-2">{color}</td>
+                            <td className="px-3 py-2">{pct == null ? (t?.remain == null ? "-" : t.remain) : `${Math.round(pct)}%`}</td>
+                            <td className="px-3 py-2">{official ? "官方" : "第三方/未知"}</td>
+                            <td className="px-3 py-2">{matchText}</td>
                           </tr>
                         );
                       })}
                       {trays.length === 0 ? (
                         <tr>
-                          <td colSpan={5} className="px-3 py-6 text-center text-muted-foreground">
+                          <td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">
                             暂无 AMS 托盘信息（请确认打印机有上报 `ams_trays`）
                           </td>
                         </tr>

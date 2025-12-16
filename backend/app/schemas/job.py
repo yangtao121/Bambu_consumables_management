@@ -22,7 +22,7 @@ class JobOut(APIModel):
 
 
 class ManualConsumptionCreate(BaseModel):
-    spool_id: UUID
+    stock_id: UUID
     grams: int = Field(ge=0)
     note: str | None = None
 
@@ -30,12 +30,29 @@ class ManualConsumptionCreate(BaseModel):
 class JobConsumptionOut(APIModel):
     id: UUID
     job_id: UUID
-    spool_id: UUID
-    spool_name: str
-    spool_material: str
-    spool_color: str
+    tray_id: int | None = None
+    stock_id: UUID | None = None
+    material: str | None = None
+    color: str | None = None
+    brand: str | None = None
+
+    # legacy fields (spool-mode)
+    spool_id: UUID | None = None
+    spool_name: str | None = None
+    spool_material: str | None = None
+    spool_color: str | None = None
+
     grams: int
     source: str
     confidence: str
     created_at: datetime
+
+
+class JobMaterialResolveItem(BaseModel):
+    tray_id: int
+    stock_id: UUID
+
+
+class JobMaterialResolve(BaseModel):
+    items: list[JobMaterialResolveItem] = Field(default_factory=list)
 

@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.db.models.consumption_record import ConsumptionRecord
-from app.db.models.spool import Spool
 
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -29,20 +28,13 @@ async def summary_report(
     start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
     today_dt = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
 
-    unit_cost = func.coalesce(
-        (Spool.price_per_kg / 1000.0),
-        (Spool.price_total / func.nullif(Spool.initial_grams, 0)),
-        0.0,
-    )
-
     # 今日汇总
     today_stmt = (
         select(
             func.sum(ConsumptionRecord.grams).label("grams"),
-            func.sum(ConsumptionRecord.grams * unit_cost).label("cost_est"),
+            func.sum(0.0).label("cost_est"),
         )
-        .join(Spool, Spool.id == ConsumptionRecord.spool_id)
-        .where(ConsumptionRecord.created_at >= today_dt)
+        .where(ConsumptionRecord.created_at >= today_dt, ConsumptionRecord.stock_id.is_not(None))
     )
     today_row = (await db.execute(today_stmt)).first()
 
@@ -50,10 +42,9 @@ async def summary_report(
     last_stmt = (
         select(
             func.sum(ConsumptionRecord.grams).label("grams"),
-            func.sum(ConsumptionRecord.grams * unit_cost).label("cost_est"),
+            func.sum(0.0).label("cost_est"),
         )
-        .join(Spool, Spool.id == ConsumptionRecord.spool_id)
-        .where(ConsumptionRecord.created_at >= start_dt)
+        .where(ConsumptionRecord.created_at >= start_dt, ConsumptionRecord.stock_id.is_not(None))
     )
     last_row = (await db.execute(last_stmt)).first()
 
@@ -63,10 +54,9 @@ async def summary_report(
         select(
             day,
             func.sum(ConsumptionRecord.grams).label("grams"),
-            func.sum(ConsumptionRecord.grams * unit_cost).label("cost_est"),
+            func.sum(0.0).label("cost_est"),
         )
-        .join(Spool, Spool.id == ConsumptionRecord.spool_id)
-        .where(ConsumptionRecord.created_at >= start_dt)
+        .where(ConsumptionRecord.created_at >= start_dt, ConsumptionRecord.stock_id.is_not(None))
         .group_by(day)
         .order_by(day.asc())
     )
@@ -108,16 +98,9 @@ async def monthly_report(
         select(
             month,
             func.sum(ConsumptionRecord.grams).label("grams"),
-            func.sum(
-                ConsumptionRecord.grams
-                * func.coalesce(
-                    (Spool.price_per_kg / 1000.0),
-                    (Spool.price_total / func.nullif(Spool.initial_grams, 0)),
-                    0.0,
-                )
-            ).label("cost_est"),
+            func.sum(0.0).label("cost_est"),
         )
-        .join(Spool, Spool.id == ConsumptionRecord.spool_id)
+        .where(ConsumptionRecord.stock_id.is_not(None))
         .group_by(month)
         .order_by(month.desc())
     )
