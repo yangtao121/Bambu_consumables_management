@@ -226,12 +226,12 @@ export default function Page() {
               const occurredAt = rep?.occurred_at || null;
 
               return (
-                <tr key={p.id} style={{ borderBottom: "1px solid #f3f4f6" }}>
-                  <td style={{ padding: 6 }}>{p.alias || "-"}</td>
-                  <td style={{ padding: 6 }}>{p.serial}</td>
-                  <td style={{ padding: 6 }}>{p.ip}</td>
-                  <td style={{ padding: 6 }}>{p.status}</td>
-                  <td style={{ padding: 6 }}>{p.last_seen || "-"}</td>
+              <tr key={p.id} style={{ borderBottom: "1px solid #f3f4f6" }}>
+                <td style={{ padding: 6 }}>{p.alias || "-"}</td>
+                <td style={{ padding: 6 }}>{p.serial}</td>
+                <td style={{ padding: 6 }}>{p.ip}</td>
+                <td style={{ padding: 6 }}>{p.status}</td>
+                <td style={{ padding: 6 }}>{p.last_seen || "-"}</td>
                   <td style={{ padding: 6 }}>{formatGcodeState(gcodeState)}</td>
                   <td style={{ padding: 6 }}>{progress == null ? "-" : `${progress}%`}</td>
                   <td style={{ padding: 6 }}>
@@ -245,7 +245,7 @@ export default function Page() {
                     {remain == null ? "" : `（remain ${remain}%）`}
                   </td>
                   <td style={{ padding: 6 }}>{fmtTime(occurredAt)}</td>
-                </tr>
+              </tr>
               );
             })}
           </tbody>
