@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.consumption_record import ConsumptionRecord
+from app.db.models.ams_color_mapping import AmsColorMapping
 from app.db.models.material_stock import MaterialStock
 from app.db.models.normalized_event import NormalizedEvent
 from app.db.models.print_job import PrintJob
@@ -67,7 +68,28 @@ def _remain_by_tray(data: dict) -> dict[int, float]:
     return out
 
 
-_OFFICIAL_BRAND = "官方"
+_OFFICIAL_BRAND = "拓竹"
+
+
+def _normalize_color_to_hex_or_name(v: object) -> tuple[str | None, str | None]:
+    """
+    Normalize AMS tray color:
+    - If v is 6/8-hex like 'FFFFFF'/'FFFFFFFF' (optionally with '#'), return (color_hex='#RRGGBB', color_name=None)
+    - Otherwise treat it as a human color name string and return (None, color_name)
+    """
+    if not isinstance(v, str):
+        return (None, None)
+    s = v.strip()
+    if not s:
+        return (None, None)
+    hx = s[1:].strip() if s.startswith("#") else s
+    hx_u = hx.upper()
+    is_hex = all(c in "0123456789ABCDEF" for c in hx_u)
+    if is_hex and len(hx_u) == 8:
+        return (f"#{hx_u[-6:]}", None)
+    if is_hex and len(hx_u) == 6:
+        return (f"#{hx_u}", None)
+    return (None, s)
 
 
 def _is_official_tray(t: dict) -> bool:
@@ -95,6 +117,7 @@ def _tray_meta_by_tray(data: dict) -> dict[int, dict]:
     out: dict[int, dict] = {}
     if not isinstance(trays, list):
         return out
+
     for t in trays:
         if not isinstance(t, dict):
             continue
@@ -102,16 +125,40 @@ def _tray_meta_by_tray(data: dict) -> dict[int, dict]:
         if not isinstance(tid, int):
             continue
         material = t.get("type")
-        color = t.get("color")
+        color_hex, color_name = _normalize_color_to_hex_or_name(t.get("color"))
         meta = {
             "material": material if isinstance(material, str) else None,
-            "color": color if isinstance(color, str) else None,
+            # Stock matching key: mapped color name (e.g. '白色'). Might be None when unmapped.
+            "color": color_name,
+            # Raw/normalized AMS hex color (e.g. '#FFFFFF') if available
+            "color_hex": color_hex,
             "is_official": _is_official_tray(t),
             "tag_uid": t.get("tag_uid"),
             "tray_uuid": t.get("tray_uuid"),
             "tray_id_name": t.get("tray_id_name"),
         }
         out[int(tid)] = meta
+    return out
+
+
+async def _hydrate_tray_color_names(session: AsyncSession, tm: dict) -> dict:
+    """
+    Fill meta['color'] from persisted mapping by meta['color_hex'] when possible.
+    Returns a shallow-copied dict to avoid mutating JSONB snapshots in-place.
+    """
+    out: dict = {}
+    for k, v in (tm or {}).items():
+        if not isinstance(v, dict):
+            out[k] = v
+            continue
+        meta = dict(v)
+        if not meta.get("color") and isinstance(meta.get("color_hex"), str) and meta["color_hex"].startswith("#"):
+            name = await session.scalar(
+                select(AmsColorMapping.color_name).where(AmsColorMapping.color_hex == meta["color_hex"]).limit(1)
+            )
+            if isinstance(name, str) and name.strip():
+                meta["color"] = name.strip()
+        out[k] = meta
     return out
 
 
@@ -201,16 +248,21 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
     if ev.type == "PrintStarted":
         job.status = "running"
         job.started_at = job.started_at or ev.occurred_at
-        tray_meta_by_tray = _tray_meta_by_tray(data)
+        tray_meta_by_tray = await _hydrate_tray_color_names(session, _tray_meta_by_tray(data))
         tray_to_stock: dict[str, str] = {}
         pending_trays: list[int] = []
         for tray_id, meta in tray_meta_by_tray.items():
-            sid = await _resolve_stock_id(
-                session,
-                material=meta.get("material"),
-                color=meta.get("color"),
-                is_official=bool(meta.get("is_official")),
-            )
+            # 空槽/未知槽：不参与归因与 pending（避免把 AMS 空位当成“待归因”）
+            if not meta.get("material") or (not meta.get("color") and not meta.get("color_hex")):
+                continue
+            sid = None
+            if meta.get("color"):
+                sid = await _resolve_stock_id(
+                    session,
+                    material=meta.get("material"),
+                    color=meta.get("color"),
+                    is_official=bool(meta.get("is_official")),
+                )
             if sid:
                 tray_to_stock[str(tray_id)] = str(sid)
             else:
@@ -243,6 +295,43 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             if job.status not in {"ended", "failed"}:
                 job.status = "running"
 
+        # Cold-start / mid-print takeover: if snapshot missing, initialize from current progress event.
+        # This enables "正在打印"的情况下也能在结束时结算扣料（精度受接管时点影响，但比完全不结算更好）。
+        snap = job.spool_binding_snapshot_json or {}
+        if (
+            job.status == "running"
+            and (not isinstance(snap, dict) or snap.get("mode") != "stock" or "start_remain_by_tray" not in snap)
+        ):
+            tray_meta_by_tray = await _hydrate_tray_color_names(session, _tray_meta_by_tray(data))
+            tray_to_stock: dict[str, str] = {}
+            pending_trays: list[int] = []
+            for tray_id, meta in tray_meta_by_tray.items():
+                if not meta.get("material") or (not meta.get("color") and not meta.get("color_hex")):
+                    continue
+                sid = None
+                if meta.get("color"):
+                    sid = await _resolve_stock_id(
+                        session,
+                        material=meta.get("material"),
+                        color=meta.get("color"),
+                        is_official=bool(meta.get("is_official")),
+                    )
+                if sid:
+                    tray_to_stock[str(tray_id)] = str(sid)
+                else:
+                    pending_trays.append(int(tray_id))
+            trays_seen: list[int] = [int(tray_now)] if isinstance(tray_now, int) else []
+            job.spool_binding_snapshot_json = {
+                "mode": "stock",
+                "tray_to_stock": tray_to_stock,
+                "tray_now": tray_now,
+                "start_remain_by_tray": _remain_by_tray(data),
+                "trays_seen": trays_seen,
+                "tray_meta_by_tray": tray_meta_by_tray,
+                "pending_trays": sorted(set(pending_trays)),
+                "pending_consumptions": [],
+            }
+
         # Track trays seen during the print (multi-color / tray switch)
         if job.status == "running" and isinstance(tray_now, int):
             snap = job.spool_binding_snapshot_json or {}
@@ -259,14 +348,18 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             snap2["trays_seen"] = sorted(seen_set)
 
             # Refresh tray meta (color/material can appear later), and try to auto-resolve new trays.
-            tm = _tray_meta_by_tray(data)
+            tm = await _hydrate_tray_color_names(session, _tray_meta_by_tray(data))
             old_tm = snap2.get("tray_meta_by_tray") if isinstance(snap2.get("tray_meta_by_tray"), dict) else {}
             merged_tm = dict(old_tm)
             for k, v in tm.items():
                 merged_tm[str(int(k))] = v
+            merged_tm = await _hydrate_tray_color_names(session, merged_tm)
             snap2["tray_meta_by_tray"] = merged_tm
 
-            tray_to_stock = snap2.get("tray_to_stock") if isinstance(snap2.get("tray_to_stock"), dict) else {}
+            # IMPORTANT: copy nested dict/list to avoid in-place mutations on JSONB snapshot
+            tray_to_stock = (
+                dict(snap2.get("tray_to_stock")) if isinstance(snap2.get("tray_to_stock"), dict) else {}
+            )
             pending = snap2.get("pending_trays") if isinstance(snap2.get("pending_trays"), list) else []
             pending_set: set[int] = set()
             for p in pending:
@@ -281,12 +374,17 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                     continue
                 meta = merged_tm.get(str(tray_id))
                 if isinstance(meta, dict):
-                    sid = await _resolve_stock_id(
-                        session,
-                        material=meta.get("material"),
-                        color=meta.get("color"),
-                        is_official=bool(meta.get("is_official")),
-                    )
+                    if not meta.get("material") or (not meta.get("color") and not meta.get("color_hex")):
+                        # 空槽/未知槽不参与 pending
+                        continue
+                    sid = None
+                    if meta.get("color"):
+                        sid = await _resolve_stock_id(
+                            session,
+                            material=meta.get("material"),
+                            color=meta.get("color"),
+                            is_official=bool(meta.get("is_official")),
+                        )
                     if sid:
                         tray_to_stock[str(tray_id)] = str(sid)
                         if tray_id in pending_set:
@@ -308,11 +406,15 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
     # 结算：只在结束/失败时尝试生成扣料记录
     if ev.type in {"PrintEnded", "PrintFailed"}:
         snap = job.spool_binding_snapshot_json or {}
-        tray_to_stock = snap.get("tray_to_stock") if isinstance(snap.get("tray_to_stock"), dict) else {}
-        start_remain_by_tray = snap.get("start_remain_by_tray") if isinstance(snap.get("start_remain_by_tray"), dict) else {}
-        trays_seen = snap.get("trays_seen") if isinstance(snap.get("trays_seen"), list) else []
-        tray_meta_by_tray = snap.get("tray_meta_by_tray") if isinstance(snap.get("tray_meta_by_tray"), dict) else {}
-        pending_consumptions = snap.get("pending_consumptions") if isinstance(snap.get("pending_consumptions"), list) else []
+        # IMPORTANT: copy nested dict/list to avoid in-place mutations on JSONB snapshot
+        tray_to_stock = dict(snap.get("tray_to_stock")) if isinstance(snap.get("tray_to_stock"), dict) else {}
+        start_remain_by_tray = (
+            dict(snap.get("start_remain_by_tray")) if isinstance(snap.get("start_remain_by_tray"), dict) else {}
+        )
+        trays_seen = list(snap.get("trays_seen")) if isinstance(snap.get("trays_seen"), list) else []
+        tray_meta_by_tray = dict(snap.get("tray_meta_by_tray")) if isinstance(snap.get("tray_meta_by_tray"), dict) else {}
+        pending_consumptions = list(snap.get("pending_consumptions")) if isinstance(snap.get("pending_consumptions"), list) else []
+        tray_meta_by_tray = await _hydrate_tray_color_names(session, tray_meta_by_tray)
 
         snap_tray_now = _normalize_tray_now(snap.get("tray_now"))
         effective_tray_now = tray_now if tray_now is not None else snap_tray_now
@@ -393,12 +495,14 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             if stock_uuid is None:
                 meta = tray_meta_by_tray.get(str(tray_id)) or tray_meta_by_tray.get(tray_id)
                 if isinstance(meta, dict):
-                    sid = await _resolve_stock_id(
-                        session,
-                        material=meta.get("material"),
-                        color=meta.get("color"),
-                        is_official=bool(meta.get("is_official")),
-                    )
+                    sid = None
+                    if meta.get("color"):
+                        sid = await _resolve_stock_id(
+                            session,
+                            material=meta.get("material"),
+                            color=meta.get("color"),
+                            is_official=bool(meta.get("is_official")),
+                        )
                     if sid:
                         stock_uuid = sid
                         tray_to_stock[str(tray_id)] = str(sid)
@@ -406,6 +510,13 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             if stock_uuid is None:
                 # Pending attribution: record pct delta or grams delta for later settlement
                 meta = tray_meta_by_tray.get(str(tray_id)) or tray_meta_by_tray.get(tray_id) or {}
+                if not (
+                    isinstance(meta, dict)
+                    and meta.get("material")
+                    and (meta.get("color") or meta.get("color_hex"))
+                ):
+                    continue
+                eff_conf = "low" if (not meta.get("color") and meta.get("color_hex")) else confidence
                 pending_consumptions.append(
                     {
                         "tray_id": int(tray_id),
@@ -415,9 +526,10 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                         "grams": int(grams) if source == "ams_remain_delta_grams" else None,
                         "pct_delta": float(pct_delta) if source == "ams_remain_delta_pct" and pct_delta is not None else None,
                         "source": source,
-                        "confidence": confidence,
+                        "confidence": eff_conf,
                         "material": meta.get("material"),
                         "color": meta.get("color"),
+                        "color_hex": meta.get("color_hex"),
                         "is_official": bool(meta.get("is_official")),
                     }
                 )

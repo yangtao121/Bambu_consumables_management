@@ -51,6 +51,9 @@ export default function Page() {
   const [items, setItems] = useState([]);
   const [reportsById, setReportsById] = useState({});
   const [stocks, setStocks] = useState([]);
+  const [colorMappings, setColorMappings] = useState({});
+  const [colorDraftByHex, setColorDraftByHex] = useState({});
+  const [savingColorHex, setSavingColorHex] = useState(null);
   const [loading, setLoading] = useState(false);
 
   const printerIdsKey = items
@@ -77,9 +80,58 @@ export default function Page() {
     }
   }
 
+  function normalizeColorHex(v) {
+    if (v == null) return null;
+    const s0 = String(v).trim();
+    if (!s0) return null;
+    const raw = s0.startsWith("#") ? s0.slice(1).trim() : s0;
+    const hx = raw.toUpperCase();
+    if (!/^[0-9A-F]+$/.test(hx)) return null;
+    if (hx.length === 8) return `#${hx.slice(-6)}`;
+    if (hx.length === 6) return `#${hx}`;
+    return null;
+  }
+
+  async function reloadColorMappings() {
+    try {
+      const rows = await fetchJson("/color-mappings");
+      const map = {};
+      for (const r of Array.isArray(rows) ? rows : []) {
+        if (r?.color_hex && r?.color_name) map[String(r.color_hex)] = String(r.color_name);
+      }
+      setColorMappings(map);
+    } catch (e) {
+      toast.error(String(e?.message || e));
+    }
+  }
+
+  async function saveColorMapping(colorHex) {
+    const name = String(colorDraftByHex[colorHex] || "").trim();
+    if (!name) {
+      toast.error("请输入要映射的颜色名（如：白色/灰色）");
+      return;
+    }
+    try {
+      setSavingColorHex(colorHex);
+      await fetchJson("/color-mappings", {
+        method: "POST",
+        body: JSON.stringify({ color_hex: colorHex, color_name: name })
+      });
+      toast.success(`已保存映射：${colorHex} -> ${name}`);
+      setColorDraftByHex((prev) => ({ ...prev, [colorHex]: "" }));
+      await reloadColorMappings();
+      await reloadStocks();
+    } catch (e) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setSavingColorHex(null);
+    }
+  }
+
   useEffect(() => {
     reload();
     reloadStocks();
+    reloadColorMappings();
 
     // Realtime updates via SSE
     const url = `${apiBaseUrl()}/realtime/printers`;
@@ -219,6 +271,9 @@ export default function Page() {
           <Button variant="outline" onClick={reloadStocks}>
             刷新库存
           </Button>
+          <Button variant="outline" onClick={reloadColorMappings}>
+            刷新颜色映射
+          </Button>
         </div>
       </div>
 
@@ -288,14 +343,17 @@ export default function Page() {
           const currentTray =
             trayNow == null || trayNow === 255 ? null : trays.find((t) => Number(t?.id) === Number(trayNow)) || null;
           const currentMaterial = currentTray?.type || "-";
-          const currentColor = currentTray?.color || "-";
+          const currentColorHex = normalizeColorHex(currentTray?.color);
+          const currentColorName = currentColorHex ? colorMappings[currentColorHex] || null : currentTray?.color || null;
+          const currentColor = currentColorName ? `${currentColorName}${currentColorHex ? ` (${currentColorHex})` : ""}` : currentColorHex || currentTray?.color || "-";
           const currentOfficial = currentTray ? isOfficialTray(currentTray) : false;
+          const currentColorKey = currentColorName || (!currentColorHex && typeof currentTray?.color === "string" ? currentTray.color : null);
           const currentCandidates = currentTray
             ? stocks.filter(
                 (s) =>
                   s.material === currentMaterial &&
-                  s.color === currentColor &&
-                  (currentOfficial ? s.brand === "官方" : s.brand !== "官方")
+                  (currentColorKey ? s.color === currentColorKey : false) &&
+                  (currentOfficial ? s.brand === "拓竹" : s.brand !== "拓竹")
               )
             : [];
           const currentStock = currentCandidates.length === 1 ? currentCandidates[0] : null;
@@ -320,10 +378,19 @@ export default function Page() {
                     <div className="text-muted-foreground">上报：{fmtTime(occurredAt)}</div>
                     <div className="text-muted-foreground">当前托盘：{trayNow == null || trayNow === 255 ? "-" : `Tray ${trayNow}`}</div>
                     <div className="text-muted-foreground">
-                      当前耗材：{currentTray ? `${currentMaterial} · ${currentColor}${currentOfficial ? "（官方）" : ""}` : "-"}
+                      当前耗材：{currentTray ? `${currentMaterial} · ${currentColor}${currentOfficial ? "（拓竹）" : ""}` : "-"}
                     </div>
                     <div className="text-muted-foreground">
-                      扣减库存：{currentStock ? `${currentStock.brand}（剩余 ${currentStock.remaining_grams}g）` : currentTray ? (currentCandidates.length > 1 ? "多品牌冲突（打印后归因）" : "未匹配库存项") : "-"}
+                      扣减库存：
+                      {currentTray
+                        ? currentColorHex && !currentColorName
+                          ? "颜色未映射（先映射再匹配）"
+                          : currentStock
+                            ? `${currentStock.brand}（剩余 ${currentStock.remaining_grams}g）`
+                            : currentCandidates.length > 1
+                              ? "多品牌冲突（打印后归因）"
+                              : "未匹配库存项"
+                        : "-"}
                     </div>
                   </div>
                 </div>
@@ -350,30 +417,57 @@ export default function Page() {
                         const isActiveTray = trayNow != null && trayNow !== 255 && Number(trayNow) === Number(trayId);
                         const pct = normalizeRemainPct(t?.remain);
                         const material = t?.type || "-";
-                        const color = t?.color || "-";
+                        const colorHex = normalizeColorHex(t?.color);
+                        const mappedName = colorHex ? colorMappings[colorHex] || null : null;
+                        const colorKey = mappedName || (!colorHex && typeof t?.color === "string" ? t.color : null);
+                        const colorDisplay = mappedName ? `${mappedName} (${colorHex})` : colorHex || t?.color || "-";
                         const official = isOfficialTray(t);
                         const candidates = stocks.filter(
                           (s) =>
                             s.material === material &&
-                            s.color === color &&
-                            (official ? s.brand === "官方" : s.brand !== "官方")
+                            (colorKey ? s.color === colorKey : false) &&
+                            (official ? s.brand === "拓竹" : s.brand !== "拓竹")
                         );
                         const matched = candidates.length === 1 ? candidates[0] : null;
                         const matchText =
-                          matched
-                            ? `${matched.brand}（剩余 ${matched.remaining_grams}g）`
-                            : candidates.length > 1
-                              ? `多品牌冲突：${candidates.map((c) => c.brand).join(" / ")}（打印后归因）`
-                              : "未匹配（去库存新增）";
+                          colorHex && !mappedName
+                            ? "颜色未映射（先映射）"
+                            : matched
+                              ? `${matched.brand}（剩余 ${matched.remaining_grams}g）`
+                              : candidates.length > 1
+                                ? `多品牌冲突：${candidates.map((c) => c.brand).join(" / ")}（打印后归因）`
+                                : "未匹配（去库存新增）";
                         return (
                           <tr key={key} className={`border-t ${isActiveTray ? "bg-accent/30" : ""}`}>
                             <td className="px-3 py-2 font-medium">
                               Tray {trayId} {isActiveTray ? <span className="ml-2 text-xs text-muted-foreground">(正在使用)</span> : null}
                             </td>
                             <td className="px-3 py-2">{material}</td>
-                            <td className="px-3 py-2">{color}</td>
+                            <td className="px-3 py-2">
+                              <div>{colorDisplay}</div>
+                              {colorHex && !mappedName ? (
+                                <div className="mt-2 flex items-center gap-2">
+                                  <Input
+                                    className="h-8"
+                                    placeholder="映射为：白色/灰色/…"
+                                    value={colorDraftByHex[colorHex] || ""}
+                                    onChange={(e) =>
+                                      setColorDraftByHex((prev) => ({ ...prev, [colorHex]: e.target.value }))
+                                    }
+                                  />
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={savingColorHex === colorHex}
+                                    onClick={() => saveColorMapping(colorHex)}
+                                  >
+                                    {savingColorHex === colorHex ? "保存中…" : "保存"}
+                                  </Button>
+                                </div>
+                              ) : null}
+                            </td>
                             <td className="px-3 py-2">{pct == null ? (t?.remain == null ? "-" : t.remain) : `${Math.round(pct)}%`}</td>
-                            <td className="px-3 py-2">{official ? "官方" : "第三方/未知"}</td>
+                            <td className="px-3 py-2">{official ? "拓竹" : "第三方/未知"}</td>
                             <td className="px-3 py-2">{matchText}</td>
                           </tr>
                         );

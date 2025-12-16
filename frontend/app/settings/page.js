@@ -1,11 +1,22 @@
 export default function Page() {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <h1 style={{ margin: 0 }}>Settings</h1>
-      <p style={{ margin: 0, color: "#374151" }}>
-        MVP：单位/成本策略/实时通道等配置入口（先放占位）。
-      </p>
-      <div style={{ border: "1px solid #e5e7eb", padding: 12 }}>TODO</div>
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+        <p className="text-sm text-muted-foreground">配置入口（逐步补齐）。</p>
+      </div>
+
+      <div className="rounded-md border p-4">
+        <div className="font-medium">颜色映射</div>
+        <div className="mt-1 text-sm text-muted-foreground">
+          将 AMS 颜色码（如 FFFFFF/FFFFFFFF）映射成“白色/灰色”等，用于库存匹配与自动扣减。
+        </div>
+        <div className="mt-3">
+          <a className="text-sm font-medium underline underline-offset-4" href="/settings/color-mappings">
+            去管理颜色映射
+          </a>
+        </div>
+      </div>
     </div>
   );
 }

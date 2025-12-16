@@ -41,6 +41,9 @@ export default function Page({ params }) {
   const [job, setJob] = useState(null);
   const [cons, setCons] = useState([]);
   const [stocks, setStocks] = useState([]);
+  const [colorMappings, setColorMappings] = useState({});
+  const [colorDraftByHex, setColorDraftByHex] = useState({});
+  const [savingColorHex, setSavingColorHex] = useState(null);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const [resolveMap, setResolveMap] = useState({});
@@ -50,14 +53,58 @@ export default function Page({ params }) {
     defaultValues: { stock_id: "", grams: 0, note: "" }
   });
 
+  function normalizeColorHex(v) {
+    if (v == null) return null;
+    const s0 = String(v).trim();
+    if (!s0) return null;
+    const raw = s0.startsWith("#") ? s0.slice(1).trim() : s0;
+    const hx = raw.toUpperCase();
+    if (!/^[0-9A-F]+$/.test(hx)) return null;
+    if (hx.length === 8) return `#${hx.slice(-6)}`;
+    if (hx.length === 6) return `#${hx}`;
+    return null;
+  }
+
+  async function saveColorMapping(colorHex) {
+    const name = String(colorDraftByHex[colorHex] || "").trim();
+    if (!name) {
+      toast.error("请输入要映射的颜色名（如：白色/灰色）");
+      return;
+    }
+    try {
+      setSavingColorHex(colorHex);
+      await fetchJson("/color-mappings", {
+        method: "POST",
+        body: JSON.stringify({ color_hex: colorHex, color_name: name })
+      });
+      toast.success(`已保存映射：${colorHex} -> ${name}`);
+      setColorDraftByHex((prev) => ({ ...prev, [colorHex]: "" }));
+      await reload();
+    } catch (e) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setSavingColorHex(null);
+    }
+  }
+
   async function reload() {
     if (!jobId) return;
     setLoading(true);
     try {
-      const [j, c, s] = await Promise.all([fetchJson(`/jobs/${jobId}`), fetchJson(`/jobs/${jobId}/consumptions`), fetchJson("/stocks")]);
+      const [j, c, s, cm] = await Promise.all([
+        fetchJson(`/jobs/${jobId}`),
+        fetchJson(`/jobs/${jobId}/consumptions`),
+        fetchJson("/stocks"),
+        fetchJson("/color-mappings")
+      ]);
       setJob(j);
       setCons(Array.isArray(c) ? c : []);
       setStocks(Array.isArray(s) ? s : []);
+      const map = {};
+      for (const r of Array.isArray(cm) ? cm : []) {
+        if (r?.color_hex && r?.color_name) map[String(r.color_hex)] = String(r.color_name);
+      }
+      setColorMappings(map);
       setResolveMap({});
     } finally {
       setLoading(false);
@@ -102,16 +149,25 @@ export default function Page({ params }) {
 
   function candidatesFor(entry) {
     const material = entry?.material;
-    const color = entry?.color;
+    const colorHex = normalizeColorHex(entry?.color_hex);
+    const color = entry?.color || (colorHex ? colorMappings[colorHex] || null : null);
     const isOfficial = Boolean(entry?.is_official);
+    if (!material || !color) return [];
     return stocks.filter(
-      (s) => s.material === material && s.color === color && (isOfficial ? s.brand === "官方" : s.brand !== "官方")
+      (s) => s.material === material && s.color === color && (isOfficial ? s.brand === "拓竹" : s.brand !== "拓竹")
     );
   }
 
   async function resolvePending() {
     const items = [];
     for (const trayId of pendingTrays) {
+      const entry = pending.find((e) => String(e.tray_id) === String(trayId)) || null;
+      const colorHex = normalizeColorHex(entry?.color_hex);
+      const colorName = entry?.color || (colorHex ? colorMappings[colorHex] || null : null);
+      if (entry?.material && colorHex && !colorName) {
+        toast.error(`Tray ${trayId} 颜色未映射（${colorHex}），请先映射颜色名再归因`);
+        return;
+      }
       const stockId = resolveMap[trayId];
       if (!stockId) {
         toast.error(`请为 Tray ${trayId} 选择库存项`);
@@ -205,19 +261,44 @@ export default function Page({ params }) {
                 {pendingTrays.map((trayId) => {
                   const entry = pending.find((e) => String(e.tray_id) === String(trayId)) || null;
                   const opts = entry ? candidatesFor(entry) : [];
+                  const colorHex = normalizeColorHex(entry?.color_hex);
+                  const colorName = entry?.color || (colorHex ? colorMappings[colorHex] || null : null);
+                  const colorDisplay = colorName ? `${colorName}${colorHex ? ` (${colorHex})` : ""}` : colorHex || entry?.color || "-";
+                  const needsMapping = Boolean(entry?.material && colorHex && !colorName);
                   return (
                     <div key={trayId} className="grid grid-cols-1 gap-2 md:grid-cols-12 md:items-center">
                       <div className="md:col-span-2 font-medium">Tray {trayId}</div>
                       <div className="md:col-span-4 text-sm text-muted-foreground">
-                        {entry ? `${entry.material || "-"} · ${entry.color || "-"} ${entry.is_official ? "（官方）" : ""}` : "-"}
+                        {entry ? `${entry.material || "-"} · ${colorDisplay} ${entry.is_official ? "（拓竹）" : ""}` : "-"}
                         {entry?.unit === "pct" && entry?.pct_delta != null ? ` · 消耗 ${Number(entry.pct_delta).toFixed(1)}%` : ""}
                         {entry?.unit === "grams" && entry?.grams != null ? ` · 消耗 ${entry.grams}g` : ""}
+                        {needsMapping ? <span className="ml-2 text-xs text-destructive">颜色未映射</span> : null}
                       </div>
                       <div className="md:col-span-6">
+                        {needsMapping ? (
+                          <div className="mb-2 flex items-center gap-2">
+                            <Input
+                              className="h-9"
+                              placeholder="先把颜色码映射为：白色/灰色/…"
+                              value={colorDraftByHex[colorHex] || ""}
+                              onChange={(e) =>
+                                setColorDraftByHex((prev) => ({ ...prev, [colorHex]: e.target.value }))
+                              }
+                            />
+                            <Button
+                              variant="outline"
+                              disabled={savingColorHex === colorHex}
+                              onClick={() => saveColorMapping(colorHex)}
+                            >
+                              {savingColorHex === colorHex ? "保存中…" : "保存映射"}
+                            </Button>
+                          </div>
+                        ) : null}
                         <select
                           className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                           value={resolveMap[trayId] || ""}
                           onChange={(e) => setResolveMap((prev) => ({ ...prev, [trayId]: e.target.value }))}
+                          disabled={needsMapping}
                         >
                           <option value="">选择库存项…</option>
                           {(opts.length ? opts : stocks).map((s) => (

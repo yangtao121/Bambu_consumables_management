@@ -16,7 +16,7 @@ import { Label } from "../../components/ui/label";
 const createSchema = z.object({
   material: z.string().trim().min(1, "请输入材质"),
   color: z.string().trim().min(1, "请输入颜色"),
-  brand: z.string().trim().min(1, "请输入品牌（官方/其他）"),
+  brand: z.string().trim().min(1, "请输入品牌（拓竹/其他）"),
   roll_weight_grams: z.coerce.number().int().min(1, "单卷克数必须 >= 1"),
   rolls_count: z.coerce.number().int().min(0, "卷数必须 >= 0")
 });
@@ -27,7 +27,7 @@ export default function Page() {
 
   const form = useForm({
     resolver: zodResolver(createSchema),
-    defaultValues: { material: "PLA", color: "白色", brand: "官方", roll_weight_grams: 1000, rolls_count: 1 }
+    defaultValues: { material: "PLA", color: "白色", brand: "拓竹", roll_weight_grams: 1000, rolls_count: 1 }
   });
 
   async function reload() {
@@ -77,7 +77,7 @@ export default function Page() {
         <Card className="lg:col-span-2">
           <CardHeader>
             <CardTitle>新增库存项</CardTitle>
-            <CardDescription>建议官方耗材的品牌填“官方”，第三方填品牌名。</CardDescription>
+            <CardDescription>建议拓竹官方耗材的品牌填“拓竹”，第三方填品牌名。</CardDescription>
           </CardHeader>
           <CardContent>
             <form
@@ -106,7 +106,7 @@ export default function Page() {
                 </div>
                 <div className="grid gap-2">
                   <Label>品牌 *</Label>
-                  <Input {...form.register("brand")} placeholder="官方/某品牌" />
+                  <Input {...form.register("brand")} placeholder="拓竹/某品牌" />
                   {form.formState.errors.brand ? <div className="text-xs text-destructive">{form.formState.errors.brand.message}</div> : null}
                 </div>
                 <div className="grid gap-2">
