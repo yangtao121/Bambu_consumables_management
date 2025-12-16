@@ -178,20 +178,50 @@ def _normalize_event_from_payload(payload: dict) -> dict | None:
     except Exception:
         progress_int = None
 
+    def _to_int(v: object) -> int | None:
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            vv = v.strip()
+            if vv.isdigit():
+                try:
+                    return int(vv)
+                except Exception:
+                    return None
+        return None
+
     ams = p.get("ams") if isinstance(p.get("ams"), dict) else None
-    tray_now = ams.get("tray_now") if isinstance(ams, dict) else None
-    trays = ams.get("tray") if isinstance(ams, dict) and isinstance(ams.get("tray"), list) else []
+    tray_now_raw = ams.get("tray_now") if isinstance(ams, dict) else None
+
+    trays: list[dict] = []
+    if isinstance(ams, dict):
+        # Some firmwares report trays directly under `ams.tray`
+        if isinstance(ams.get("tray"), list):
+            trays.extend([t for t in ams["tray"] if isinstance(t, dict)])
+        # More commonly: `ams.ams` is a list of AMS units, each has `tray` list
+        if isinstance(ams.get("ams"), list):
+            for unit in ams["ams"]:
+                if isinstance(unit, dict) and isinstance(unit.get("tray"), list):
+                    trays.extend([t for t in unit["tray"] if isinstance(t, dict)])
+
+    tray_now = _to_int(tray_now_raw)
 
     tray_list = []
     for t in trays:
-        if not isinstance(t, dict):
+        # id/tray_now are often strings in payload
+        tid = _to_int(t.get("id"))
+        if tid is None:
             continue
         tray_list.append(
             {
-                "id": t.get("id"),
-                "type": t.get("type"),
-                "color": t.get("color"),
+                "id": tid,
+                "type": t.get("tray_type") or t.get("type"),
+                "color": t.get("tray_color") or t.get("color"),
                 "remain": t.get("remain"),
+                # Useful for future auto-mapping / debugging
+                "tag_uid": t.get("tag_uid"),
+                "tray_uuid": t.get("tray_uuid"),
+                "tray_id_name": t.get("tray_id_name"),
             }
         )
 
@@ -203,17 +233,26 @@ def _normalize_event_from_payload(payload: dict) -> dict | None:
         "mc_remaining_time": p.get("mc_remaining_time"),
         "gcode_start_time": p.get("gcode_start_time"),
         "gcode_file": p.get("gcode_file"),
+        "task_id": p.get("task_id") or p.get("job_id") or p.get("subtask_id"),
+        "subtask_id": p.get("subtask_id"),
+        "subtask_name": p.get("subtask_name"),
     }
 
 
 def _derive_event_type(gcode_state: str | None, last_state: str | None) -> str:
     # MVP：用 gcode_state 变更推导生命周期
     if last_state != gcode_state:
-        if gcode_state in {"RUNNING"}:
+        running_states = {"RUNNING"}
+        ended_states = {"IDLE", "FINISH"}
+        failed_states = {"FAILED", "STOPPED", "CANCELED"}
+
+        # Start when entering RUNNING from non-running state
+        if gcode_state in running_states and last_state not in running_states:
             return "PrintStarted"
-        if gcode_state in {"IDLE"} and last_state in {"RUNNING"}:
+        # End when leaving RUNNING to FINISH/IDLE
+        if gcode_state in ended_states and last_state in running_states:
             return "PrintEnded"
-        if gcode_state in {"FAILED", "STOPPED", "CANCELED"}:
+        if gcode_state in failed_states:
             return "PrintFailed"
         return "StateChanged"
     return "PrintProgress"

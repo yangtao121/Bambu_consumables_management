@@ -27,4 +27,4 @@ pnpm-debug.log*
 
 # IDE
 .idea/
-
+.cursor/

@@ -70,7 +70,13 @@ async def latest_report(printer_id: UUID, db: AsyncSession = Depends(get_db)) ->
         )
     ).scalars().first()
 
-    return {"printer_id": str(printer_id), "event": ev.data_json if ev else None}
+    return {
+        "printer_id": str(printer_id),
+        "event": ev.data_json if ev else None,
+        "type": ev.type if ev else None,
+        "event_id": ev.event_id if ev else None,
+        "occurred_at": ev.occurred_at.isoformat() if ev else None,
+    }
 
 
 @router.patch("/{printer_id}", response_model=PrinterDetail)

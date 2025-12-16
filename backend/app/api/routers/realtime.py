@@ -72,7 +72,16 @@ async def sse_printer(printer_id: UUID, db: AsyncSession = Depends(get_db)) -> S
             ).scalars().first()
             if ev and ev.event_id != last_event_id:
                 last_event_id = ev.event_id
-                yield _sse({"printer_id": str(printer_id), "type": ev.type, "data": ev.data_json}, event="printer")
+                yield _sse(
+                    {
+                        "printer_id": str(printer_id),
+                        "type": ev.type,
+                        "event_id": ev.event_id,
+                        "occurred_at": ev.occurred_at.isoformat(),
+                        "data": ev.data_json,
+                    },
+                    event="printer",
+                )
             await asyncio.sleep(0.5)
 
     return StreamingResponse(gen(), media_type="text/event-stream")

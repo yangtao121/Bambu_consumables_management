@@ -18,8 +18,32 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _normalize_tray_now(v: object) -> int | None:
+    """
+    Payload tray_now is sometimes a numeric string; 255 usually means "no active tray".
+    """
+    n: int | None = None
+    if isinstance(v, int):
+        n = v
+    elif isinstance(v, str):
+        s = v.strip()
+        if s.isdigit():
+            try:
+                n = int(s)
+            except Exception:
+                n = None
+    if n == 255:
+        return None
+    return n
+
+
 def _make_job_key(printer_id: uuid.UUID, ev: NormalizedEvent) -> str:
     data = ev.data_json or {}
+    task_id = data.get("task_id") or data.get("subtask_id")
+    if isinstance(task_id, (int, float)) and task_id:
+        return f"{printer_id}:{int(task_id)}"
+    if isinstance(task_id, str) and task_id.strip():
+        return f"{printer_id}:{task_id.strip()}"
     gcode_start_time = data.get("gcode_start_time")
     gcode_file = data.get("gcode_file") or ""
     if isinstance(gcode_start_time, (int, float)) and gcode_start_time > 0:
@@ -61,8 +85,9 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
     ).scalars().first()
 
     data = ev.data_json or {}
-    tray_now = data.get("tray_now")
+    tray_now = _normalize_tray_now(data.get("tray_now"))
     file_name = data.get("gcode_file")
+    gcode_state = data.get("gcode_state")
 
     if job is None:
         # 只有收到开始/进度才创建，结束事件也允许创建以便追溯
@@ -97,8 +122,20 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
         }
 
     elif ev.type in {"PrintProgress", "StateChanged"}:
-        if job.status not in {"ended", "failed"}:
-            job.status = "running"
+        # Use gcode_state as source-of-truth to avoid "FINISH but running" on cold start.
+        if isinstance(gcode_state, str):
+            if gcode_state in {"FINISH", "IDLE"}:
+                job.status = "ended"
+                job.ended_at = job.ended_at or ev.occurred_at
+            elif gcode_state in {"FAILED", "STOPPED", "CANCELED"}:
+                job.status = "failed"
+                job.ended_at = job.ended_at or ev.occurred_at
+            else:
+                if job.status not in {"ended", "failed"}:
+                    job.status = "running"
+        else:
+            if job.status not in {"ended", "failed"}:
+                job.status = "running"
 
     elif ev.type == "PrintEnded":
         job.status = "ended"
@@ -114,9 +151,12 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
         tray_to_spool = snap.get("tray_to_spool") if isinstance(snap.get("tray_to_spool"), dict) else {}
         start_remain_by_tray = snap.get("start_remain_by_tray") if isinstance(snap.get("start_remain_by_tray"), dict) else {}
 
+        snap_tray_now = _normalize_tray_now(snap.get("tray_now"))
+        effective_tray_now = tray_now if tray_now is not None else snap_tray_now
+
         spool_id_str = None
-        if isinstance(tray_now, int):
-            spool_id_str = tray_to_spool.get(str(tray_now)) or tray_to_spool.get(tray_now)
+        if isinstance(effective_tray_now, int):
+            spool_id_str = tray_to_spool.get(str(effective_tray_now)) or tray_to_spool.get(effective_tray_now)
 
         if spool_id_str:
             spool_uuid = uuid.UUID(str(spool_id_str))
@@ -126,15 +166,30 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             )
             if not exists:
                 end_remain_by_tray = _remain_by_tray(data)
+                # 结束事件可能不包含 AMS 托盘细节：回溯最近事件找一条有 remain 的
+                if not end_remain_by_tray:
+                    recent = (
+                        await session.execute(
+                            select(NormalizedEvent)
+                            .where(NormalizedEvent.printer_id == printer_id)
+                            .order_by(NormalizedEvent.occurred_at.desc(), NormalizedEvent.id.desc())
+                            .limit(20)
+                        )
+                    ).scalars().all()
+                    for rev in recent:
+                        rb = _remain_by_tray(rev.data_json or {})
+                        if rb:
+                            end_remain_by_tray = rb
+                            break
                 grams = 0
                 source = "unknown"
                 confidence = "low"
 
                 # 若 start/end remain 都可用，则做差；单位不确定，因此仍标 medium 且允许纠错
                 try:
-                    if isinstance(tray_now, int):
-                        s_val = start_remain_by_tray.get(str(tray_now)) or start_remain_by_tray.get(tray_now)
-                        e_val = end_remain_by_tray.get(tray_now)
+                    if isinstance(effective_tray_now, int):
+                        s_val = start_remain_by_tray.get(str(effective_tray_now)) or start_remain_by_tray.get(effective_tray_now)
+                        e_val = end_remain_by_tray.get(effective_tray_now)
                         if isinstance(s_val, (int, float)) and isinstance(e_val, (int, float)) and e_val >= 0 and s_val >= e_val:
                             grams = int(s_val - e_val)
                             source = "ams_remain_delta"
