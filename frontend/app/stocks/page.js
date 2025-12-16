@@ -39,6 +39,9 @@ export default function Page() {
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteRefInfo, setDeleteRefInfo] = useState(null);
   const [deleting, setDeleting] = useState(false);
+  const [colorQuery, setColorQuery] = useState("");
+  const [sortKey, setSortKey] = useState("remaining"); // remaining | created | updated
+  const [sortDir, setSortDir] = useState("desc"); // asc | desc
 
   const form = useForm({
     resolver: zodResolver(createSchema),
@@ -61,6 +64,55 @@ export default function Page() {
   }, []);
 
   const activeItems = useMemo(() => items.filter((s) => !s?.is_archived), [items]);
+  const archivedItems = useMemo(() => items.filter((s) => Boolean(s?.is_archived)), [items]);
+
+  const filteredActiveItems = useMemo(() => {
+    const needle = colorQuery.trim().toLowerCase();
+    if (!needle) return activeItems;
+    return activeItems.filter((s) => String(s?.color || "").toLowerCase().includes(needle));
+  }, [activeItems, colorQuery]);
+
+  const sortedActiveItems = useMemo(() => {
+    const dirMul = sortDir === "asc" ? 1 : -1;
+    const getVal = (s) => {
+      if (sortKey === "created") return Date.parse(s?.created_at || "") || 0;
+      if (sortKey === "updated") return Date.parse(s?.updated_at || "") || 0;
+      return Number(s?.remaining_grams || 0);
+    };
+    const cmp = (a, b) => {
+      const av = getVal(a);
+      const bv = getVal(b);
+      if (av < bv) return -1 * dirMul;
+      if (av > bv) return 1 * dirMul;
+      const ah = `${a?.material || ""}\u0000${a?.color || ""}\u0000${a?.brand || ""}`.toLowerCase();
+      const bh = `${b?.material || ""}\u0000${b?.color || ""}\u0000${b?.brand || ""}`.toLowerCase();
+      if (ah < bh) return -1;
+      if (ah > bh) return 1;
+      return String(a?.id || "").localeCompare(String(b?.id || ""));
+    };
+    return [...filteredActiveItems].sort(cmp);
+  }, [filteredActiveItems, sortKey, sortDir]);
+
+  const sortedArchivedItems = useMemo(() => {
+    const dirMul = sortDir === "asc" ? 1 : -1;
+    const getVal = (s) => {
+      if (sortKey === "created") return Date.parse(s?.created_at || "") || 0;
+      if (sortKey === "updated") return Date.parse(s?.updated_at || "") || 0;
+      return Number(s?.remaining_grams || 0);
+    };
+    const cmp = (a, b) => {
+      const av = getVal(a);
+      const bv = getVal(b);
+      if (av < bv) return -1 * dirMul;
+      if (av > bv) return 1 * dirMul;
+      const ah = `${a?.material || ""}\u0000${a?.color || ""}\u0000${a?.brand || ""}`.toLowerCase();
+      const bh = `${b?.material || ""}\u0000${b?.color || ""}\u0000${b?.brand || ""}`.toLowerCase();
+      if (ah < bh) return -1;
+      if (ah > bh) return 1;
+      return String(a?.id || "").localeCompare(String(b?.id || ""));
+    };
+    return [...archivedItems].sort(cmp);
+  }, [archivedItems, sortKey, sortDir]);
   const totalRemaining = useMemo(
     () => activeItems.reduce((acc, s) => acc + Number(s.remaining_grams || 0), 0),
     [activeItems]
@@ -114,6 +166,30 @@ export default function Page() {
           <p className="text-sm text-muted-foreground">按「材质 + 颜色 + 品牌」维护总库存（卷数 × 单卷重量）。</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <Input
+            className="h-9 w-56"
+            placeholder="按颜色搜索（未归档）"
+            value={colorQuery}
+            onChange={(e) => setColorQuery(e.target.value)}
+          />
+          <select
+            className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+            value={sortKey}
+            onChange={(e) => setSortKey(e.target.value)}
+            aria-label="排序字段"
+          >
+            <option value="remaining">按剩余克数</option>
+            <option value="updated">按更新时间</option>
+            <option value="created">按创建时间</option>
+          </select>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}
+            aria-label="切换升序/降序"
+          >
+            {sortDir === "desc" ? "降序" : "升序"}
+          </Button>
           <label className="flex select-none items-center gap-2 text-sm text-muted-foreground">
             <input
               type="checkbox"
@@ -183,17 +259,12 @@ export default function Page() {
                 </tr>
               </thead>
               <tbody>
-                {items.map((s) => (
+                {sortedActiveItems.map((s) => (
                   <tr key={s.id} className="border-t">
                     <td className="px-3 py-2">
                       <Link className="font-medium hover:underline" href={`/stocks/${s.id}`}>
                         {s.material} · {s.color} · {s.brand}
                       </Link>
-                      {s?.is_archived ? (
-                        <span className="ml-2 align-middle">
-                          <Badge variant="outline">已归档</Badge>
-                        </span>
-                      ) : null}
                     </td>
                     <td className="px-3 py-2">{s.roll_weight_grams}g</td>
                     <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
@@ -214,10 +285,50 @@ export default function Page() {
                     </td>
                   </tr>
                 ))}
-                {items.length === 0 ? (
+                {includeArchived && sortedArchivedItems.length ? (
+                  <tr className="border-t bg-muted/30">
+                    <td colSpan={5} className="px-3 py-2 text-xs text-muted-foreground">
+                      已归档（不参与颜色搜索过滤）
+                    </td>
+                  </tr>
+                ) : null}
+                {includeArchived
+                  ? sortedArchivedItems.map((s) => (
+                      <tr key={s.id} className="border-t">
+                        <td className="px-3 py-2">
+                          <Link className="font-medium hover:underline" href={`/stocks/${s.id}`}>
+                            {s.material} · {s.color} · {s.brand}
+                          </Link>
+                          <span className="ml-2 align-middle">
+                            <Badge variant="outline">已归档</Badge>
+                          </span>
+                        </td>
+                        <td className="px-3 py-2">{s.roll_weight_grams}g</td>
+                        <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
+                        <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
+                        <td className="px-3 py-2">
+                          <Button variant="destructive" size="sm" disabled>
+                            删除
+                          </Button>
+                        </td>
+                      </tr>
+                    ))
+                  : null}
+                {!includeArchived && sortedActiveItems.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="px-3 py-8 text-center text-muted-foreground">
-                      暂无库存项，请点击右上角“新增库存”。
+                      {colorQuery.trim()
+                        ? "未找到匹配该颜色的未归档库存项。"
+                        : "暂无库存项，请点击右上角“新增库存”。"}
+                    </td>
+                  </tr>
+                ) : null}
+                {includeArchived && sortedActiveItems.length === 0 && sortedArchivedItems.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-3 py-8 text-center text-muted-foreground">
+                      {colorQuery.trim()
+                        ? "未找到匹配该颜色的未归档库存项。（归档项不会参与搜索过滤）"
+                        : "暂无库存项，请点击右上角“新增库存”。"}
                     </td>
                   </tr>
                 ) : null}
