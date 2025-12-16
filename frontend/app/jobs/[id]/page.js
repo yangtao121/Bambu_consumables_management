@@ -94,7 +94,7 @@ export default function Page({ params }) {
       const [j, c, s, cm] = await Promise.all([
         fetchJson(`/jobs/${jobId}`),
         fetchJson(`/jobs/${jobId}/consumptions`),
-        fetchJson("/stocks"),
+        fetchJson("/stocks?include_archived=1"),
         fetchJson("/color-mappings")
       ]);
       setJob(j);
@@ -303,7 +303,8 @@ export default function Page({ params }) {
                           <option value="">选择库存项…</option>
                           {(opts.length ? opts : stocks).map((s) => (
                             <option key={s.id} value={s.id}>
-                              {s.material}/{s.color}/{s.brand} - {s.remaining_grams}g
+                              {s.material}/{s.color}/{s.brand}
+                              {s.is_archived ? "（已归档）" : ""} - {s.remaining_grams}g
                             </option>
                           ))}
                         </select>
@@ -396,7 +397,8 @@ export default function Page({ params }) {
                 <option value="">请选择…</option>
                 {stocks.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.material}/{s.color}/{s.brand} - {s.remaining_grams}g
+                    {s.material}/{s.color}/{s.brand}
+                    {s.is_archived ? "（已归档）" : ""} - {s.remaining_grams}g
                   </option>
                 ))}
               </select>
