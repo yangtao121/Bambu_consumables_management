@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query
@@ -12,6 +13,86 @@ from app.db.models.spool import Spool
 
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+@router.get("/summary")
+async def summary_report(
+    days: int = Query(default=7, ge=1, le=90),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Dashboard 用：返回今日、近 N 天消耗汇总 + 近 N 天逐日趋势。
+    """
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    start_date = today - timedelta(days=days - 1)
+    start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+    today_dt = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+
+    unit_cost = func.coalesce(
+        (Spool.price_per_kg / 1000.0),
+        (Spool.price_total / func.nullif(Spool.initial_grams, 0)),
+        0.0,
+    )
+
+    # 今日汇总
+    today_stmt = (
+        select(
+            func.sum(ConsumptionRecord.grams).label("grams"),
+            func.sum(ConsumptionRecord.grams * unit_cost).label("cost_est"),
+        )
+        .join(Spool, Spool.id == ConsumptionRecord.spool_id)
+        .where(ConsumptionRecord.created_at >= today_dt)
+    )
+    today_row = (await db.execute(today_stmt)).first()
+
+    # 近 N 天汇总
+    last_stmt = (
+        select(
+            func.sum(ConsumptionRecord.grams).label("grams"),
+            func.sum(ConsumptionRecord.grams * unit_cost).label("cost_est"),
+        )
+        .join(Spool, Spool.id == ConsumptionRecord.spool_id)
+        .where(ConsumptionRecord.created_at >= start_dt)
+    )
+    last_row = (await db.execute(last_stmt)).first()
+
+    # 逐日趋势
+    day = func.date_trunc("day", ConsumptionRecord.created_at).label("day")
+    daily_stmt = (
+        select(
+            day,
+            func.sum(ConsumptionRecord.grams).label("grams"),
+            func.sum(ConsumptionRecord.grams * unit_cost).label("cost_est"),
+        )
+        .join(Spool, Spool.id == ConsumptionRecord.spool_id)
+        .where(ConsumptionRecord.created_at >= start_dt)
+        .group_by(day)
+        .order_by(day.asc())
+    )
+    daily_rows = (await db.execute(daily_stmt)).all()
+
+    return {
+        "days": days,
+        "from_date": start_date.isoformat(),
+        "to_date": today.isoformat(),
+        "today": {
+            "grams": int((today_row.grams if today_row else 0) or 0),
+            "cost_est": float((today_row.cost_est if today_row else 0.0) or 0.0),
+        },
+        "last": {
+            "grams": int((last_row.grams if last_row else 0) or 0),
+            "cost_est": float((last_row.cost_est if last_row else 0.0) or 0.0),
+        },
+        "daily": [
+            {
+                "day": r.day.date().isoformat() if r.day is not None else None,
+                "grams": int(r.grams or 0),
+                "cost_est": float(r.cost_est or 0.0),
+            }
+            for r in daily_rows
+        ],
+    }
 
 
 @router.get("/monthly")

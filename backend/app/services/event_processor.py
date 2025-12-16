@@ -134,8 +134,8 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                 if job.status not in {"ended", "failed"}:
                     job.status = "running"
         else:
-        if job.status not in {"ended", "failed"}:
-            job.status = "running"
+            if job.status not in {"ended", "failed"}:
+                job.status = "running"
 
     elif ev.type == "PrintEnded":
         job.status = "ended"

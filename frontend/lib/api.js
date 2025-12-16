@@ -2,28 +2,69 @@ export function apiBaseUrl() {
   return process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 }
 
-export async function fetchJson(path, init) {
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/4ce5cedd-1b32-4497-a199-8b8693bfebf9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'frontend/lib/api.js:fetchJson:pre',message:'fetchJson request',data:{baseUrl:apiBaseUrl(),path,method:(init&&init.method)||'GET'},timestamp:Date.now(),sessionId:'debug-session',runId:(process.env.NEXT_PUBLIC_DEBUG_RUN_ID||'run1'),hypothesisId:'E'})}).catch(()=>{});
-  // #endregion
-  const res = await fetch(`${apiBaseUrl()}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init && init.headers ? init.headers : {})
-    },
-    cache: "no-store"
-  });
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/4ce5cedd-1b32-4497-a199-8b8693bfebf9',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'frontend/lib/api.js:fetchJson:post',message:'fetchJson response',data:{path,status:res.status,ok:res.ok},timestamp:Date.now(),sessionId:'debug-session',runId:(process.env.NEXT_PUBLIC_DEBUG_RUN_ID||'run1'),hypothesisId:'E'})}).catch(()=>{});
-  // #endregion
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${res.status} ${text}`);
+export class ApiError extends Error {
+  constructor(message, { status, detail, raw } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.raw = raw;
   }
+}
+
+async function safeReadBody(res) {
   const ct = res.headers.get("content-type") || "";
-  if (ct.includes("application/json")) return await res.json();
-  return await res.text();
+  if (ct.includes("application/json")) {
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchJson(path, init = {}) {
+  const controller = new AbortController();
+  const timeoutMs = init.timeoutMs ?? 15000;
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${apiBaseUrl()}${path}`, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(init && init.headers ? init.headers : {})
+      },
+      cache: "no-store"
+    });
+
+    if (!res.ok) {
+      const body = await safeReadBody(res);
+      const detail =
+        body && typeof body === "object" && "detail" in body ? body.detail : null;
+      const msg =
+        typeof detail === "string"
+          ? detail
+          : `${res.status} ${res.statusText || "Request failed"}`;
+      throw new ApiError(msg, { status: res.status, detail, raw: body });
+    }
+
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("application/json")) return await res.json();
+    return await res.text();
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      throw new ApiError("请求超时，请检查 API 服务是否正常", { status: 0 });
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 

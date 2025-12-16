@@ -23,3 +23,7 @@ class TrayMappingOut(APIModel):
     unbound_at: datetime | None
 
 
+class TrayMappingUnbind(BaseModel):
+    printer_id: UUID
+    tray_id: int
+

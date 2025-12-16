@@ -11,7 +11,7 @@ from app.api.deps import get_db
 from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.print_job import PrintJob
 from app.db.models.spool import Spool
-from app.schemas.job import JobOut, ManualConsumptionCreate
+from app.schemas.job import JobConsumptionOut, JobOut, ManualConsumptionCreate
 from app.services.spool_service import recalc_spool_remaining
 
 
@@ -39,6 +39,39 @@ async def get_job(job_id: UUID, db: AsyncSession = Depends(get_db)) -> PrintJob:
     if not j:
         raise HTTPException(status_code=404, detail="job not found")
     return j
+
+
+@router.get("/{job_id}/consumptions", response_model=list[JobConsumptionOut])
+async def list_job_consumptions(job_id: UUID, db: AsyncSession = Depends(get_db)) -> list[JobConsumptionOut]:
+    if not await db.get(PrintJob, job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+
+    rows = (
+        await db.execute(
+            select(ConsumptionRecord, Spool)
+            .join(Spool, Spool.id == ConsumptionRecord.spool_id)
+            .where(ConsumptionRecord.job_id == job_id)
+            .order_by(ConsumptionRecord.created_at.asc())
+        )
+    ).all()
+
+    out: list[JobConsumptionOut] = []
+    for c, s in rows:
+        out.append(
+            JobConsumptionOut(
+                id=c.id,
+                job_id=c.job_id,
+                spool_id=c.spool_id,
+                spool_name=s.name,
+                spool_material=s.material,
+                spool_color=s.color,
+                grams=int(c.grams),
+                source=c.source,
+                confidence=c.confidence,
+                created_at=c.created_at,
+            )
+        )
+    return out
 
 
 @router.post("/{job_id}/consumptions")

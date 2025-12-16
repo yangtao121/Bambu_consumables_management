@@ -27,3 +27,15 @@ class ManualConsumptionCreate(BaseModel):
     note: str | None = None
 
 
+class JobConsumptionOut(APIModel):
+    id: UUID
+    job_id: UUID
+    spool_id: UUID
+    spool_name: str
+    spool_material: str
+    spool_color: str
+    grams: int
+    source: str
+    confidence: str
+    created_at: datetime
+
