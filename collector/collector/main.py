@@ -258,8 +258,132 @@ def _derive_event_type(gcode_state: str | None, last_state: str | None) -> str:
     return "PrintProgress"
 
 
+def _ams_signature(normalized_data: dict) -> str:
+    """
+    Build a stable signature for AMS-related state to avoid over-aggressive de-duplication.
+
+    We intentionally include fields that reflect *physical* tray changes even when progress
+    does not move (e.g. user swaps filament, tray becomes empty/filled).
+    """
+    tray_now = normalized_data.get("tray_now")
+    trays = normalized_data.get("ams_trays")
+    items: list[dict] = []
+    if isinstance(trays, list):
+        for t in trays:
+            if not isinstance(t, dict):
+                continue
+            tid = t.get("id")
+            try:
+                tid_i = int(tid)
+            except Exception:
+                continue
+            items.append(
+                {
+                    "id": tid_i,
+                    "type": t.get("type"),
+                    "color": t.get("color"),
+                    "remain": t.get("remain"),
+                    "tag_uid": t.get("tag_uid"),
+                    "tray_uuid": t.get("tray_uuid"),
+                    "tray_id_name": t.get("tray_id_name"),
+                }
+            )
+    items.sort(key=lambda x: x.get("id", 0))
+    blob = {
+        "tray_now": tray_now,
+        "trays": items,
+    }
+    # orjson.dumps is stable with OPT_SORT_KEYS; then hash to a short comparable string.
+    return _sha256_hex(orjson.dumps(blob, option=orjson.OPT_SORT_KEYS))
+
+
+def _selftest_ams_dedup() -> None:
+    """
+    Lightweight regression test for the dedupe rule:
+    - progress unchanged + AMS changed => MUST NOT skip normalized_events write
+    - progress unchanged + AMS unchanged => MAY skip
+    """
+
+    def _payload_with_trays(trays: list[dict]) -> dict:
+        return {
+            "print": {
+                "gcode_state": "RUNNING",
+                "mc_percent": 50,
+                "gcode_file": "demo.gcode",
+                "task_id": 123,
+                "ams": {
+                    "tray_now": "0",
+                    "ams": [
+                        {
+                            "tray": trays,
+                        }
+                    ],
+                },
+            }
+        }
+
+    # No AMS field -> normalize to empty trays; signature should still be stable
+    p_none = {"print": {"gcode_state": "RUNNING", "mc_percent": 50, "gcode_file": "demo.gcode", "task_id": 123}}
+    n_none = _normalize_event_from_payload(p_none)
+    assert isinstance(n_none, dict)
+    assert n_none.get("progress") == 50
+    assert n_none.get("tray_now") is None
+    assert isinstance(n_none.get("ams_trays"), list) and len(n_none["ams_trays"]) == 0
+    sig_none = _ams_signature(n_none)
+    assert sig_none == _ams_signature(n_none)
+
+    # 3 trays (0/1/2)
+    p1 = _payload_with_trays(
+        [
+            {"id": "0", "tray_type": "PLA", "tray_color": "FFFFFF", "remain": 90},
+            {"id": "1", "tray_type": "PLA", "tray_color": "FF0000", "remain": 80},
+            {"id": "2", "tray_type": "PLA", "tray_color": "00FF00", "remain": 70},
+        ]
+    )
+    n1 = _normalize_event_from_payload(p1)
+    assert isinstance(n1, dict)
+    assert n1.get("progress") == 50
+    assert isinstance(n1.get("ams_trays"), list) and len(n1["ams_trays"]) == 3
+    assert any(t.get("id") == 2 for t in n1["ams_trays"])
+    sig1 = _ams_signature(n1)
+    assert isinstance(sig1, str) and len(sig1) > 0
+
+    # 4th tray appears (id="3" string) while progress stays the same
+    p2 = _payload_with_trays(
+        [
+            {"id": "0", "tray_type": "PLA", "tray_color": "FFFFFF", "remain": 90},
+            {"id": "1", "tray_type": "PLA", "tray_color": "FF0000", "remain": 80},
+            {"id": "2", "tray_type": "PLA", "tray_color": "00FF00", "remain": 70},
+            # remain can be 0~1 fraction in some firmwares; include to ensure signature captures it.
+            {"id": "3", "tray_type": "PLA", "tray_color": "0000FF", "remain": 0.6},
+        ]
+    )
+    n2 = _normalize_event_from_payload(p2)
+    assert isinstance(n2, dict)
+    assert n2.get("progress") == 50
+    assert isinstance(n2.get("ams_trays"), list) and len(n2["ams_trays"]) == 4
+    assert any(t.get("id") == 3 for t in n2["ams_trays"])
+    sig2 = _ams_signature(n2)
+    assert sig2 != sig1
+
+    # Simulate dedupe decision with prior state (PrintProgress)
+    last_state = "RUNNING"
+    last_progress = 50
+    last_sig = sig1
+    event_type = _derive_event_type(n2.get("gcode_state"), last_state)
+    assert event_type == "PrintProgress"
+
+    should_skip_when_changed = event_type == "PrintProgress" and n2.get("progress") == last_progress and sig2 == last_sig
+    assert should_skip_when_changed is False
+
+    # Unchanged AMS + unchanged progress => skip is allowed
+    should_skip_when_same = event_type == "PrintProgress" and n1.get("progress") == last_progress and _ams_signature(n1) == last_sig
+    assert should_skip_when_same is True
+
+
 async def ingest_loop(ingest_q: "asyncio.Queue[IngestItem]") -> None:
-    state_by_printer: dict[uuid.UUID, tuple[str | None, int | None]] = {}
+    # (last_gcode_state, last_progress, last_ams_sig)
+    state_by_printer: dict[uuid.UUID, tuple[str | None, int | None, str | None]] = {}
 
     while True:
         item = await ingest_q.get()
@@ -294,16 +418,18 @@ async def ingest_loop(ingest_q: "asyncio.Queue[IngestItem]") -> None:
             if normalized_data is not None:
                 gcode_state = normalized_data.get("gcode_state")
                 progress_int = normalized_data.get("progress")
+                ams_sig = _ams_signature(normalized_data)
 
-                last_state, last_progress = state_by_printer.get(item.printer_id, (None, None))
+                last_state, last_progress, last_ams_sig = state_by_printer.get(item.printer_id, (None, None, None))
                 event_type = _derive_event_type(gcode_state, last_state)
 
-                # 降噪：progress 未变化时不写 normalized_events（但 raw_events 仍保留）
-                if event_type == "PrintProgress" and progress_int is not None and progress_int == last_progress:
+                # 降噪：只有在 *进度不变* 且 *AMS 也不变* 时才跳过写入 normalized_events（raw_events 仍保留）。
+                # 这样可以保证“换料/空槽变化（但进度不动）”也会生成新事件，驱动前端更新。
+                if event_type == "PrintProgress" and progress_int == last_progress and ams_sig == last_ams_sig:
                     await session.commit()
                     continue
 
-                state_by_printer[item.printer_id] = (gcode_state, progress_int)
+                state_by_printer[item.printer_id] = (gcode_state, progress_int, ams_sig)
 
                 ev = {
                     "event_id": _event_id_for_payload(item.printer_id, payload_hash),
@@ -371,6 +497,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Allow running a quick regression test without any DB/mqtt dependency:
+    #   COLLECTOR_SELFTEST=1 python -m collector.main
+    if (__import__("os").getenv("COLLECTOR_SELFTEST") or "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+        _selftest_ams_dedup()
+        print("collector selftest OK")
+    else:
+        asyncio.run(main())
 
 

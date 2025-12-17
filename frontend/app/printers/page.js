@@ -339,6 +339,17 @@ export default function Page() {
           const taskName = ev?.subtask_name || ev?.gcode_file || null;
           const trayNow = ev?.tray_now ?? null;
           const trays = Array.isArray(ev?.ams_trays) ? ev.ams_trays : [];
+          // 固定 1 个 AMS（4 槽）：即便固件不回传空槽，也要稳定展示 0-3。
+          const slotIds = [0, 1, 2, 3];
+          const trayById = new Map();
+          for (const t of trays) {
+            const tid = t?.id;
+            if (tid == null) continue;
+            const n = Number(tid);
+            if (!Number.isFinite(n)) continue;
+            trayById.set(n, t);
+          }
+          const displayTrays = slotIds.map((id) => trayById.get(id) || { id, __missing: true });
           const occurredAt = rep?.occurred_at || null;
           const currentTray =
             trayNow == null || trayNow === 255 ? null : trays.find((t) => Number(t?.id) === Number(trayNow)) || null;
@@ -410,18 +421,19 @@ export default function Page() {
                       </tr>
                     </thead>
                     <tbody>
-                      {trays.map((t) => {
+                      {displayTrays.map((t) => {
                         const trayId = t?.id;
                         if (trayId == null) return null;
                         const key = `${p.id}:${trayId}`;
                         const isActiveTray = trayNow != null && trayNow !== 255 && Number(trayNow) === Number(trayId);
+                        const isMissing = Boolean(t?.__missing);
                         const pct = normalizeRemainPct(t?.remain);
-                        const material = t?.type || "-";
-                        const colorHex = normalizeColorHex(t?.color);
+                        const material = isMissing ? "-" : t?.type || "-";
+                        const colorHex = isMissing ? null : normalizeColorHex(t?.color);
                         const mappedName = colorHex ? colorMappings[colorHex] || null : null;
-                        const colorKey = mappedName || (!colorHex && typeof t?.color === "string" ? t.color : null);
-                        const colorDisplay = mappedName ? `${mappedName} (${colorHex})` : colorHex || t?.color || "-";
-                        const official = isOfficialTray(t);
+                        const colorKey = mappedName || (!colorHex && !isMissing && typeof t?.color === "string" ? t.color : null);
+                        const colorDisplay = isMissing ? "-" : mappedName ? `${mappedName} (${colorHex})` : colorHex || t?.color || "-";
+                        const official = !isMissing && isOfficialTray(t);
                         const candidates = stocks.filter(
                           (s) =>
                             s.material === material &&
@@ -430,7 +442,9 @@ export default function Page() {
                         );
                         const matched = candidates.length === 1 ? candidates[0] : null;
                         const matchText =
-                          colorHex && !mappedName
+                          isMissing
+                            ? "-"
+                            : colorHex && !mappedName
                             ? "颜色未映射（先映射）"
                             : matched
                               ? `${matched.brand}（剩余 ${matched.remaining_grams}g）`
@@ -445,7 +459,7 @@ export default function Page() {
                             <td className="px-3 py-2">{material}</td>
                             <td className="px-3 py-2">
                               <div>{colorDisplay}</div>
-                              {colorHex && !mappedName ? (
+                              {colorHex && !mappedName && !isMissing ? (
                                 <div className="mt-2 flex items-center gap-2">
                                   <Input
                                     className="h-8"
@@ -466,19 +480,12 @@ export default function Page() {
                                 </div>
                               ) : null}
                             </td>
-                            <td className="px-3 py-2">{pct == null ? (t?.remain == null ? "-" : t.remain) : `${Math.round(pct)}%`}</td>
-                            <td className="px-3 py-2">{official ? "拓竹" : "第三方/未知"}</td>
+                            <td className="px-3 py-2">{isMissing ? "-" : pct == null ? (t?.remain == null ? "-" : t.remain) : `${Math.round(pct)}%`}</td>
+                            <td className="px-3 py-2">{isMissing ? "空槽/未上报" : official ? "拓竹" : "第三方/未知"}</td>
                             <td className="px-3 py-2">{matchText}</td>
                           </tr>
                         );
                       })}
-                      {trays.length === 0 ? (
-                        <tr>
-                          <td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">
-                            暂无 AMS 托盘信息（请确认打印机有上报 `ams_trays`）
-                          </td>
-                        </tr>
-                      ) : null}
                     </tbody>
                   </table>
                 </div>

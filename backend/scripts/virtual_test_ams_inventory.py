@@ -175,6 +175,69 @@ async def _sum_ledger_delta_for_job(session, job_id: uuid.UUID) -> int:
     )
 
 
+async def _ledger_rows_for_job(session, job_id: uuid.UUID) -> list[MaterialLedger]:
+    return (
+        (
+            await session.execute(
+                select(MaterialLedger).where(MaterialLedger.job_id == job_id).order_by(MaterialLedger.created_at.asc(), MaterialLedger.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _assert_job_ledger_and_consumptions_match(session, job: PrintJob) -> None:
+    """
+    For a settled job with resolved stock attribution:
+    - each ConsumptionRecord should correspond to exactly one MaterialLedger row (job_id == job.id)
+    - ledger delta should equal -consumed grams for that tray segment
+    - reason/kind/source should be traceable and consistent
+    """
+    cons = (
+        (
+            await session.execute(
+                select(ConsumptionRecord).where(ConsumptionRecord.job_id == job.id).order_by(ConsumptionRecord.tray_id.asc(), ConsumptionRecord.segment_idx.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ledgers = await _ledger_rows_for_job(session, job.id)
+    assert len(cons) == len(ledgers)
+    assert int(await _sum_ledger_delta_for_job(session, job.id)) == -int(await _sum_consumed_grams_for_job(session, job.id))
+
+    # Index ledgers by tray_id from their reason string (reason includes "tray=<id>")
+    led_by_tray: dict[int, MaterialLedger] = {}
+    for r in ledgers:
+        assert r.job_id == job.id
+        assert int(r.delta_grams) < 0
+        assert (r.kind or "") == "consumption"
+        reason = str(r.reason or "")
+        assert f"job={job.id}" in reason
+        assert "tray=" in reason
+        # Extract tray id from reason
+        tid: int | None = None
+        try:
+            frag = reason.split("tray=", 1)[1]
+            tok = frag.split(" ", 1)[0]
+            tid = int(tok)
+        except Exception:
+            tid = None
+        assert isinstance(tid, int)
+        led_by_tray[int(tid)] = r
+
+    for c in cons:
+        assert c.tray_id is not None
+        assert c.stock_id is not None
+        assert int(c.grams) > 0
+        # Source should be traceable to AMS remain delta algorithm.
+        assert str(c.source or "").startswith("ams_remain_start_end_")
+        r = led_by_tray.get(int(c.tray_id))
+        assert r is not None
+        assert int(r.delta_grams) == -int(c.grams_effective or c.grams)
+
+
 async def t1_ams_refresh_no_deduct() -> None:
     async with async_session_factory() as session:
         p = await _create_printer(session, "T1")
@@ -224,6 +287,7 @@ async def t1_ams_refresh_no_deduct() -> None:
 
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
         assert await _count_consumptions_for_job(session, j.id) == 0
+        assert int(await _sum_ledger_delta_for_job(session, j.id)) == 0
         await session.refresh(s)
         assert int(s.remaining_grams) == 1500
         await session.commit()
@@ -279,8 +343,10 @@ async def t2_duplicate_print_ended_idempotent() -> None:
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
         c1 = await _count_consumptions_for_job(session, j.id)
         assert c1 == 1
+        await _assert_job_ledger_and_consumptions_match(session, j)
         await session.refresh(s)
         after1 = int(s.remaining_grams)
+        assert after1 == 2000 - 200  # 80% -> 60% of 1000g
 
         # Duplicate end event (different event_id but same job)
         ev_end2 = _event(
@@ -292,6 +358,7 @@ async def t2_duplicate_print_ended_idempotent() -> None:
         await _ingest_and_process(session, ev_end2)
         c2 = await _count_consumptions_for_job(session, j.id)
         assert c2 == 1
+        await _assert_job_ledger_and_consumptions_match(session, j)
         await session.refresh(s)
         assert int(s.remaining_grams) == after1
         await session.commit()
@@ -356,6 +423,7 @@ async def t3_replay_same_events_safe() -> None:
         assert c1 == 1
         assert c2 == 1
         assert after2 == after1
+        await _assert_job_ledger_and_consumptions_match(session, j)
         await session.commit()
 
 
@@ -445,10 +513,13 @@ async def t4_switch_tray_multi_color() -> None:
         ).scalars().all()
         assert len(rows) == 2
         assert {r.tray_id for r in rows} == {0, 1}
+        await _assert_job_ledger_and_consumptions_match(session, j)
         await session.refresh(s0)
         await session.refresh(s1)
-        assert int(s0.remaining_grams) < 2000
-        assert int(s1.remaining_grams) < 2000
+        # start=90 -> end=80 => 10% of 1000g
+        assert int(s0.remaining_grams) == 2000 - 100
+        # start=90 -> end=70 => 20% of 1000g
+        assert int(s1.remaining_grams) == 2000 - 200
         await session.commit()
 
 
@@ -539,6 +610,7 @@ async def t5_remain_increase_is_ignored_start_end_only() -> None:
         assert len(rows) == 1
         assert int(rows[0].segment_idx or 0) == 0
         assert int(rows[0].grams) == 200  # only start-end: 80% -> 60% of 1000g
+        await _assert_job_ledger_and_consumptions_match(session, j)
         await session.refresh(s)
         assert int(s.remaining_grams) == 5000 - 200
         await session.commit()
@@ -618,12 +690,77 @@ async def t6_pending_resolve_repeat_idempotent() -> None:
         assert int(rows[0].tray_id or 0) == 0
         assert int(rows[0].segment_idx or 0) == 0
         assert rows[0].stock_id == s_a_id
+        # After manual resolve, ledger should match consumption with traceable reason/kind.
+        j = await session.get(PrintJob, job_id)
+        assert j is not None
+        await _assert_job_ledger_and_consumptions_match(session, j)
 
         sa = await session.get(MaterialStock, s_a_id)
         sb = await session.get(MaterialStock, s_b_id)
         assert sa is not None and sb is not None
         assert int(sa.remaining_grams) == 2000 - int(rows[0].grams)
         assert int(sb.remaining_grams) == 2000
+        await session.commit()
+
+
+async def t13_print_failed_still_settles() -> None:
+    """
+    PrintFailed should also trigger settlement (same as ended), using start/end remain.
+    """
+    async with async_session_factory() as session:
+        p = await _create_printer(session, "T13")
+        color = f"白色-{uuid.uuid4().hex[:6]}"
+        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=2000, roll_weight_grams=1000)
+        base = _utcnow()
+        task_id = 131313
+        job_key = f"{p.id}:{task_id}"
+
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintStarted",
+                occurred_at=base,
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t13.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "RUNNING",
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=True)],
+                },
+            ),
+        )
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintProgress",
+                occurred_at=base + timedelta(seconds=10),
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t13.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "RUNNING",
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=60, official=True)],
+                },
+            ),
+        )
+        # Failed (printer reports failure / canceled)
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintFailed",
+                occurred_at=base + timedelta(seconds=20),
+                data={"task_id": task_id, "gcode_file": "t13.gcode", "tray_now": 0, "gcode_state": "FAILED"},
+            ),
+        )
+
+        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
+        assert await _count_consumptions_for_job(session, j.id) == 1
+        await _assert_job_ledger_and_consumptions_match(session, j)
+        await session.refresh(s)
+        assert int(s.remaining_grams) == 2000 - 200  # 80% -> 60% of 1000g
         await session.commit()
 
 
@@ -686,6 +823,7 @@ async def t8_state_changed_finish_still_settles() -> None:
         rows = (await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id))).scalars().all()
         assert len(rows) == 1
         assert int(rows[0].grams) == 100  # 80% -> 70% of 1000g
+        await _assert_job_ledger_and_consumptions_match(session, j)
         await session.refresh(s)
         assert int(s.remaining_grams) == 2000 - 100
         await session.commit()
@@ -840,7 +978,8 @@ async def t11_stock_rename_merge() -> None:
     async with async_session_factory() as session:
         _p = await _create_printer(session, "T11")
         a = await _create_stock(session, material="PLA", color=f"白-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=400)
-        b = await _create_stock(session, material="PLA", color="合并色", brand="拓竹", remaining_grams=100)
+        # Use a unique color key to avoid conflicts across repeated local runs (DB persists).
+        b = await _create_stock(session, material="PLA", color=f"合并色-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=100)
         await session.commit()
 
         res = await update_stock(
@@ -892,6 +1031,7 @@ async def main() -> None:
         ("T10 void adjustment safety", t10_void_adjustment_safety),
         ("T11 stock rename merge", t11_stock_rename_merge),
         ("T12 job manual consumption void", t12_job_manual_consumption_void),
+        ("T13 PrintFailed still settles", t13_print_failed_still_settles),
     ]
 
     fails: list[str] = []
@@ -908,6 +1048,7 @@ async def main() -> None:
 
     if fails:
         raise SystemExit(f"failed: {fails}")
+    print(f"[SUMMARY] ran {len(tests)} tests")
 
 
 if __name__ == "__main__":
