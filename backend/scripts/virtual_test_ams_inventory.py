@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+# pyright: reportMissingImports=false
+
 import asyncio
 import os
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import httpx
 from sqlalchemy import func, select
 
-sys.path.insert(0, os.getenv("PYTHONPATH") or "/app")
+_backend_root = Path(__file__).resolve().parents[1]
+_default_pythonpath = "/app" if Path("/app/app").exists() else str(_backend_root)
+sys.path.insert(0, os.getenv("PYTHONPATH") or _default_pythonpath)
 
-from app.core.config import settings
+from app.api.routers.jobs import resolve_job_materials
 from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.material_ledger import MaterialLedger
 from app.db.models.material_stock import MaterialStock
@@ -19,6 +23,7 @@ from app.db.models.normalized_event import NormalizedEvent
 from app.db.models.printer import Printer
 from app.db.models.print_job import PrintJob
 from app.db.session import async_session_factory
+from app.schemas.job import JobMaterialResolve, JobMaterialResolveItem
 from app.services.event_processor import process_event
 
 
@@ -424,7 +429,7 @@ async def t4_switch_tray_multi_color() -> None:
         await session.commit()
 
 
-async def t5_spool_swap_split_segments() -> None:
+async def t5_remain_increase_is_ignored_start_end_only() -> None:
     async with async_session_factory() as session:
         p = await _create_printer(session, "T5")
         color = f"白色-{uuid.uuid4().hex[:6]}"
@@ -507,15 +512,12 @@ async def t5_spool_swap_split_segments() -> None:
         )
 
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        rows = (
-            await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id).order_by(ConsumptionRecord.segment_idx.asc()))
-        ).scalars().all()
-        assert len(rows) == 2
-        assert [int(r.segment_idx or 0) for r in rows] == [0, 1]
-        total = sum(int(r.grams) for r in rows)
-        assert total == 950  # 60% + 35% of 1000g
+        rows = (await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id))).scalars().all()
+        assert len(rows) == 1
+        assert int(rows[0].segment_idx or 0) == 0
+        assert int(rows[0].grams) == 200  # only start-end: 80% -> 60% of 1000g
         await session.refresh(s)
-        assert int(s.remaining_grams) == 5000 - 950
+        assert int(s.remaining_grams) == 5000 - 200
         await session.commit()
 
 
@@ -574,16 +576,15 @@ async def t6_pending_resolve_repeat_idempotent() -> None:
 
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
         job_id = j.id
-        await session.commit()  # commit before hitting HTTP API
+        await session.commit()  # commit before resolve
 
-    # Resolve pending twice via HTTP to validate router idempotency
-    base_url = getattr(settings, "api_base_url", None) or "http://localhost:8000"
-    async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as client:
-        body = {"items": [{"tray_id": 0, "stock_id": str(s_a_id)}]}
-        r1 = await client.post(f"/jobs/{job_id}/materials/resolve", json=body)
-        assert r1.status_code == 200, r1.text
-        r2 = await client.post(f"/jobs/{job_id}/materials/resolve", json=body)
-        assert r2.status_code == 200, r2.text
+    # Resolve pending twice by calling router directly to validate idempotency without running HTTP server
+    async with async_session_factory() as session:
+        body = JobMaterialResolve(items=[JobMaterialResolveItem(tray_id=0, stock_id=s_a_id)])
+        r1 = await resolve_job_materials(job_id, body, session)
+        assert r1.get("ok") is True
+        r2 = await resolve_job_materials(job_id, body, session)
+        assert r2.get("ok") is True
 
     async with async_session_factory() as session:
         # Still only one segment consumption
@@ -600,6 +601,70 @@ async def t6_pending_resolve_repeat_idempotent() -> None:
         assert sa is not None and sb is not None
         assert int(sa.remaining_grams) == 2000 - int(rows[0].grams)
         assert int(sb.remaining_grams) == 2000
+        await session.commit()
+
+
+async def t8_state_changed_finish_still_settles() -> None:
+    """
+    Simulate collector restart: FINISH arrives as StateChanged (no PrintEnded).
+    Settlement must still happen.
+    """
+    async with async_session_factory() as session:
+        p = await _create_printer(session, "T8")
+        color = f"白色-{uuid.uuid4().hex[:6]}"
+        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=2000, roll_weight_grams=1000)
+        base = _utcnow()
+        task_id = 88008
+        job_key = f"{p.id}:{task_id}"
+
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintStarted",
+                occurred_at=base,
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t8.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "RUNNING",
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=True)],
+                },
+            ),
+        )
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintProgress",
+                occurred_at=base + timedelta(seconds=10),
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t8.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "RUNNING",
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=70, official=True)],
+                },
+            ),
+        )
+
+        # No PrintEnded; only StateChanged with FINISH and no ams_trays.
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="StateChanged",
+                occurred_at=base + timedelta(seconds=20),
+                data={"task_id": task_id, "gcode_file": "t8.gcode", "tray_now": 0, "gcode_state": "FINISH"},
+            ),
+        )
+
+        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
+        rows = (await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id))).scalars().all()
+        assert len(rows) == 1
+        assert int(rows[0].grams) == 100  # 80% -> 70% of 1000g
+        await session.refresh(s)
+        assert int(s.remaining_grams) == 2000 - 100
         await session.commit()
 
 
@@ -675,9 +740,10 @@ async def main() -> None:
         ("T2 duplicate ended idempotent", t2_duplicate_print_ended_idempotent),
         ("T3 replay safe", t3_replay_same_events_safe),
         ("T4 switch tray", t4_switch_tray_multi_color),
-        ("T5 spool swap split", t5_spool_swap_split_segments),
+        ("T5 remain increase ignored (start-end only)", t5_remain_increase_is_ignored_start_end_only),
         ("T6 pending resolve repeat", t6_pending_resolve_repeat_idempotent),
         ("T7 clamp to zero", t7_clamp_to_zero_consistent),
+        ("T8 StateChanged FINISH still settles", t8_state_changed_finish_still_settles),
     ]
 
     fails: list[str] = []

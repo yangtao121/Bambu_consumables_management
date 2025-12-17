@@ -70,9 +70,6 @@ def _remain_by_tray(data: dict) -> dict[int, float]:
 
 _OFFICIAL_BRAND = "拓竹"
 
-_SPLIT_INCREASE_PCT = 5.0
-_SPLIT_INCREASE_GRAMS = 50.0
-
 
 def _normalize_color_to_hex_or_name(v: object) -> tuple[str | None, str | None]:
     """
@@ -212,38 +209,6 @@ def _normalize_remain_value(v: object) -> tuple[str, float] | None:
         return ("pct", fv)
     return ("grams", fv)
 
-def _normalized_remain_by_tray(data: dict) -> dict[int, tuple[str, float]]:
-    """
-    Parse `ams_trays[].remain` into normalized (unit, value) per tray.
-    unit is one of: 'pct' (0~100), 'grams' (absolute-ish).
-    """
-    raw = _remain_by_tray(data)
-    out: dict[int, tuple[str, float]] = {}
-    for tid, v in raw.items():
-        nv = _normalize_remain_value(v)
-        if nv:
-            out[int(tid)] = (str(nv[0]), float(nv[1]))
-    return out
-
-
-def _should_split_segment(prev_val: float, cur_val: float, unit: str) -> bool:
-    """
-    Decide whether remain "increased enough" to treat as a spool swap.
-    Small increases may be AMS calibration jitter.
-    """
-    try:
-        pv = float(prev_val)
-        cv = float(cur_val)
-    except Exception:
-        return False
-    if cv <= pv:
-        return False
-    if unit == "pct":
-        return (cv - pv) >= _SPLIT_INCREASE_PCT
-    if unit == "grams":
-        return (cv - pv) >= _SPLIT_INCREASE_GRAMS
-    return False
-
 
 async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
     printer_id = ev.printer_id
@@ -303,35 +268,17 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             else:
                 pending_trays.append(int(tray_id))
         trays_seen: list[int] = [int(tray_now)] if isinstance(tray_now, int) else []
-        # Initialize remain segments per tray (for spool swap detection)
-        segments_by_tray: dict[str, list[dict]] = {}
-        last_remain_by_tray_norm: dict[str, dict] = {}
-        for tid, (unit, val) in _normalized_remain_by_tray(data).items():
-            k = str(int(tid))
-            meta = (
-                (tray_meta_by_tray.get(int(tid)) if isinstance(tray_meta_by_tray, dict) else None)
-                or (tray_meta_by_tray.get(k) if isinstance(tray_meta_by_tray, dict) else None)
-            )
-            seg = {
-                "segment_idx": 0,
-                "unit": unit,
-                "start": float(val),
-                "min": float(val),
-                "meta": meta if isinstance(meta, dict) else {},
-            }
-            segments_by_tray[k] = [seg]
-            last_remain_by_tray_norm[k] = {"unit": unit, "value": float(val)}
         job.spool_binding_snapshot_json = {
             "mode": "stock",
             "tray_to_stock": tray_to_stock,
             "tray_now": tray_now,
             "start_remain_by_tray": _remain_by_tray(data),
-            "segments_by_tray": segments_by_tray,
-            "last_remain_by_tray_norm": last_remain_by_tray_norm,
             "trays_seen": trays_seen,
             "tray_meta_by_tray": tray_meta_by_tray,
             "pending_trays": sorted(set(pending_trays)),
             "pending_consumptions": [],
+            "settled_at": None,
+            "settle_error": None,
         }
 
     elif ev.type in {"PrintProgress", "StateChanged"}:
@@ -376,34 +323,17 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                 else:
                     pending_trays.append(int(tray_id))
             trays_seen: list[int] = [int(tray_now)] if isinstance(tray_now, int) else []
-            segments_by_tray: dict[str, list[dict]] = {}
-            last_remain_by_tray_norm: dict[str, dict] = {}
-            for tid, (unit, val) in _normalized_remain_by_tray(data).items():
-                k = str(int(tid))
-                meta = (
-                    (tray_meta_by_tray.get(int(tid)) if isinstance(tray_meta_by_tray, dict) else None)
-                    or (tray_meta_by_tray.get(k) if isinstance(tray_meta_by_tray, dict) else None)
-                )
-                seg = {
-                    "segment_idx": 0,
-                    "unit": unit,
-                    "start": float(val),
-                    "min": float(val),
-                    "meta": meta if isinstance(meta, dict) else {},
-                }
-                segments_by_tray[k] = [seg]
-                last_remain_by_tray_norm[k] = {"unit": unit, "value": float(val)}
             job.spool_binding_snapshot_json = {
                 "mode": "stock",
                 "tray_to_stock": tray_to_stock,
                 "tray_now": tray_now,
                 "start_remain_by_tray": _remain_by_tray(data),
-                "segments_by_tray": segments_by_tray,
-                "last_remain_by_tray_norm": last_remain_by_tray_norm,
                 "trays_seen": trays_seen,
                 "tray_meta_by_tray": tray_meta_by_tray,
                 "pending_trays": sorted(set(pending_trays)),
                 "pending_consumptions": [],
+                "settled_at": None,
+                "settle_error": None,
             }
 
         # Track trays seen during the print (multi-color / tray switch)
@@ -467,75 +397,9 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                         pending_set.add(int(tray_id))
             snap2["tray_to_stock"] = tray_to_stock
             snap2["pending_trays"] = sorted(pending_set)
-
-            # Update remain segments for spool-swap detection (remain increase => new segment)
-            segments_by_tray = (
-                dict(snap2.get("segments_by_tray")) if isinstance(snap2.get("segments_by_tray"), dict) else {}
-            )
-            last_norm = (
-                dict(snap2.get("last_remain_by_tray_norm")) if isinstance(snap2.get("last_remain_by_tray_norm"), dict) else {}
-            )
-            cur_norm = _normalized_remain_by_tray(data)
-            for tid, (unit, val) in cur_norm.items():
-                k = str(int(tid))
-                segs = segments_by_tray.get(k)
-                if not isinstance(segs, list):
-                    segs = []
-                segs2: list[dict] = [dict(x) for x in segs if isinstance(x, dict)]
-
-                # Ensure at least one segment exists
-                if not segs2:
-                    meta = merged_tm.get(k) if isinstance(merged_tm.get(k), dict) else {}
-                    segs2 = [
-                        {"segment_idx": 0, "unit": unit, "start": float(val), "min": float(val), "meta": dict(meta)}
-                    ]
-
-                prev = last_norm.get(k) if isinstance(last_norm.get(k), dict) else None
-                prev_unit = str(prev.get("unit")) if prev and prev.get("unit") is not None else None
-                prev_val = prev.get("value") if prev else None
-
-                # If unit changed, start a new segment to avoid mixing.
-                need_split = False
-                if prev_unit and prev_unit != unit:
-                    need_split = True
-                elif prev_unit == unit and isinstance(prev_val, (int, float)):
-                    need_split = _should_split_segment(float(prev_val), float(val), unit)
-
-                if need_split:
-                    last_idx = 0
-                    try:
-                        last_idx = int(segs2[-1].get("segment_idx") or 0)
-                    except Exception:
-                        last_idx = max(0, len(segs2) - 1)
-                    meta = merged_tm.get(k) if isinstance(merged_tm.get(k), dict) else {}
-                    segs2.append(
-                        {
-                            "segment_idx": int(last_idx) + 1,
-                            "unit": unit,
-                            "start": float(val),
-                            "min": float(val),
-                            "meta": dict(meta),
-                        }
-                    )
-                else:
-                    # update min for current segment
-                    cur_seg = dict(segs2[-1])
-                    if str(cur_seg.get("unit")) != unit:
-                        meta = merged_tm.get(k) if isinstance(merged_tm.get(k), dict) else {}
-                        cur_seg = {"segment_idx": int(cur_seg.get("segment_idx") or 0), "unit": unit, "start": float(val), "min": float(val), "meta": dict(meta)}
-                    else:
-                        try:
-                            cur_min = float(cur_seg.get("min"))
-                        except Exception:
-                            cur_min = float(val)
-                        cur_seg["min"] = float(min(cur_min, float(val)))
-                    segs2[-1] = cur_seg
-
-                segments_by_tray[k] = segs2
-                last_norm[k] = {"unit": unit, "value": float(val)}
-
-            snap2["segments_by_tray"] = segments_by_tray
-            snap2["last_remain_by_tray_norm"] = last_norm
+            # Persist last-known tray (used as a settlement fallback)
+            if tray_now is not None:
+                snap2["tray_now"] = tray_now
             job.spool_binding_snapshot_json = snap2
 
     elif ev.type == "PrintEnded":
@@ -546,15 +410,17 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
         job.status = "failed"
         job.ended_at = ev.occurred_at
 
-    # 结算：只在结束/失败时尝试生成扣料记录
-    if ev.type in {"PrintEnded", "PrintFailed"}:
+    # 结算：只要 job 进入 ended/failed 就尝试一次（避免采集端重启导致漏发 PrintEnded）
+    if job.status in {"ended", "failed"}:
         snap = job.spool_binding_snapshot_json or {}
+        if isinstance(snap, dict) and snap.get("settled_at"):
+            return
+
         # IMPORTANT: copy nested dict/list to avoid in-place mutations on JSONB snapshot
         tray_to_stock = dict(snap.get("tray_to_stock")) if isinstance(snap.get("tray_to_stock"), dict) else {}
         start_remain_by_tray = (
             dict(snap.get("start_remain_by_tray")) if isinstance(snap.get("start_remain_by_tray"), dict) else {}
         )
-        segments_by_tray = dict(snap.get("segments_by_tray")) if isinstance(snap.get("segments_by_tray"), dict) else {}
         trays_seen = list(snap.get("trays_seen")) if isinstance(snap.get("trays_seen"), list) else []
         tray_meta_by_tray = dict(snap.get("tray_meta_by_tray")) if isinstance(snap.get("tray_meta_by_tray"), dict) else {}
         pending_consumptions = list(snap.get("pending_consumptions")) if isinstance(snap.get("pending_consumptions"), list) else []
@@ -574,6 +440,14 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             trays_set.add(int(effective_tray_now))
         trays_to_settle = sorted(trays_set)
 
+        # If we never captured start snapshot, we cannot reliably settle.
+        if not start_remain_by_tray:
+            snap2 = dict(snap) if isinstance(snap, dict) else {}
+            snap2["settled_at"] = _utcnow().isoformat()
+            snap2["settle_error"] = "missing_start_remain_by_tray"
+            job.spool_binding_snapshot_json = snap2
+            return
+
         end_remain_by_tray = _remain_by_tray(data)
         # 结束事件可能不包含 AMS 托盘细节：回溯最近事件找一条有 remain 的（用于 fallback 计算）
         if not end_remain_by_tray:
@@ -592,147 +466,116 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                     break
 
         for tray_id in trays_to_settle:
-            # Prefer segment-based accounting (supports spool swap). Fallback to legacy start/end diff when missing.
-            segs_raw = segments_by_tray.get(str(tray_id)) or segments_by_tray.get(tray_id)
-            segs: list[dict] = [dict(x) for x in segs_raw if isinstance(x, dict)] if isinstance(segs_raw, list) else []
-            if not segs:
-                s_raw = start_remain_by_tray.get(str(tray_id)) or start_remain_by_tray.get(tray_id)
-                e_raw = end_remain_by_tray.get(tray_id)
-                s_nv = _normalize_remain_value(s_raw)
-                e_nv = _normalize_remain_value(e_raw)
-                if s_nv and e_nv and s_nv[0] == e_nv[0]:
-                    unit = str(s_nv[0])
-                    s_val = float(s_nv[1])
-                    e_val = float(e_nv[1])
-                    if s_val > e_val:
-                        meta0 = tray_meta_by_tray.get(str(tray_id)) or tray_meta_by_tray.get(tray_id) or {}
-                        segs = [
-                            {
-                                "segment_idx": 0,
-                                "unit": unit,
-                                "start": s_val,
-                                "min": e_val,
-                                "meta": meta0 if isinstance(meta0, dict) else {},
-                            }
-                        ]
+            segment_idx = 0
+            s_raw = start_remain_by_tray.get(str(tray_id)) or start_remain_by_tray.get(tray_id)
+            e_raw = end_remain_by_tray.get(tray_id)
+            s_nv = _normalize_remain_value(s_raw)
+            e_nv = _normalize_remain_value(e_raw)
+            if not (s_nv and e_nv and s_nv[0] == e_nv[0]):
+                continue
 
-            for seg in segs:
-                try:
-                    segment_idx = int(seg.get("segment_idx") or 0)
-                except Exception:
-                    segment_idx = 0
-                unit = str(seg.get("unit") or "")
-                try:
-                    start_v = float(seg.get("start"))
-                except Exception:
-                    continue
-                try:
-                    min_v = float(seg.get("min"))
-                except Exception:
-                    min_v = start_v
+            unit = str(s_nv[0])
+            s_val = float(s_nv[1])
+            e_val = float(e_nv[1])
+            delta_v = s_val - e_val
+            if delta_v <= 0:
+                continue
 
-                delta_v = start_v - min_v
-                if delta_v <= 0:
-                    continue
+            source = "ams_remain_start_end_pct" if unit == "pct" else "ams_remain_start_end_grams"
+            confidence = "medium"
 
-                source = "ams_remain_segment_pct" if unit == "pct" else "ams_remain_segment_grams"
-                confidence = "medium"
+            meta = tray_meta_by_tray.get(str(tray_id)) or tray_meta_by_tray.get(tray_id) or {}
+            if not isinstance(meta, dict):
+                meta = {}
 
-                meta = seg.get("meta")
-                if not isinstance(meta, dict):
-                    meta = tray_meta_by_tray.get(str(tray_id)) or tray_meta_by_tray.get(tray_id) or {}
-                if not isinstance(meta, dict):
-                    meta = {}
-
-                stock_uuid: uuid.UUID | None = None
-                if meta.get("color"):
-                    stock_uuid = await _resolve_stock_id(
-                        session,
-                        material=meta.get("material"),
-                        color=meta.get("color"),
-                        is_official=bool(meta.get("is_official")),
-                    )
-
-                if stock_uuid is None:
-                    # Pending attribution for this segment
-                    if not (meta.get("material") and (meta.get("color") or meta.get("color_hex"))):
-                        continue
-                    eff_conf = "low" if (not meta.get("color") and meta.get("color_hex")) else confidence
-                    pending_consumptions.append(
-                        {
-                            "tray_id": int(tray_id),
-                            "segment_idx": int(segment_idx),
-                            "unit": unit,
-                            "start": float(start_v),
-                            "min": float(min_v),
-                            "pct_delta": float(delta_v) if unit == "pct" else None,
-                            "grams_requested": int(round(delta_v)) if unit == "grams" else None,
-                            "source": source,
-                            "confidence": eff_conf,
-                            "material": meta.get("material"),
-                            "color": meta.get("color"),
-                            "color_hex": meta.get("color_hex"),
-                            "is_official": bool(meta.get("is_official")),
-                        }
-                    )
-                    continue
-
-                # Segment-level idempotency: same job + tray + segment
-                exists = await session.scalar(
-                    select(ConsumptionRecord.id).where(
-                        ConsumptionRecord.job_id == job.id,
-                        ConsumptionRecord.tray_id == int(tray_id),
-                        ConsumptionRecord.segment_idx == int(segment_idx),
-                    )
-                )
-                if exists:
-                    continue
-
-                stock = await session.get(MaterialStock, stock_uuid)
-                if not stock:
-                    continue
-
-                grams_requested = 0
-                if unit == "pct":
-                    grams_requested = int(round((float(delta_v) / 100.0) * float(stock.roll_weight_grams)))
-                elif unit == "grams":
-                    grams_requested = int(round(float(delta_v)))
-                if grams_requested <= 0:
-                    continue
-
-                grams_effective = min(int(grams_requested), int(stock.remaining_grams))
-                if grams_effective <= 0:
-                    continue
-
-                await apply_stock_delta(
+            stock_uuid: uuid.UUID | None = None
+            if meta.get("color"):
+                stock_uuid = await _resolve_stock_id(
                     session,
-                    stock_uuid,
-                    -int(grams_effective),
-                    reason=f"consumption job={job.id} tray={int(tray_id)} seg={int(segment_idx)} source={source}",
-                    job_id=job.id,
-                    kind="consumption",
+                    material=meta.get("material"),
+                    color=meta.get("color"),
+                    is_official=bool(meta.get("is_official")),
                 )
 
-                c = ConsumptionRecord(
-                    job_id=job.id,
-                    spool_id=None,
-                    stock_id=stock_uuid,
-                    tray_id=int(tray_id),
-                    segment_idx=int(segment_idx),
-                    grams=int(grams_effective),
-                    grams_requested=int(grams_requested),
-                    grams_effective=int(grams_effective),
-                    source=source,
-                    confidence=confidence,
-                    created_at=_utcnow(),
+            if stock_uuid is None:
+                # Pending attribution for this tray (one record per tray; segment_idx fixed at 0)
+                if not (meta.get("material") and (meta.get("color") or meta.get("color_hex"))):
+                    continue
+                eff_conf = "low" if (not meta.get("color") and meta.get("color_hex")) else confidence
+                pending_consumptions.append(
+                    {
+                        "tray_id": int(tray_id),
+                        "segment_idx": int(segment_idx),
+                        "unit": unit,
+                        "start": float(s_val),
+                        "end": float(e_val),
+                        "pct_delta": float(delta_v) if unit == "pct" else None,
+                        "grams_requested": int(round(delta_v)) if unit == "grams" else None,
+                        "source": source,
+                        "confidence": eff_conf,
+                        "material": meta.get("material"),
+                        "color": meta.get("color"),
+                        "color_hex": meta.get("color_hex"),
+                        "is_official": bool(meta.get("is_official")),
+                    }
                 )
-                session.add(c)
-                await session.flush()
+                continue
+
+            # Idempotency: same job + tray + (fixed) segment
+            exists = await session.scalar(
+                select(ConsumptionRecord.id).where(
+                    ConsumptionRecord.job_id == job.id,
+                    ConsumptionRecord.tray_id == int(tray_id),
+                    ConsumptionRecord.segment_idx == int(segment_idx),
+                )
+            )
+            if exists:
+                continue
+
+            stock = await session.get(MaterialStock, stock_uuid)
+            if not stock:
+                continue
+
+            grams_requested = 0
+            if unit == "pct":
+                grams_requested = int(round((float(delta_v) / 100.0) * float(stock.roll_weight_grams)))
+            elif unit == "grams":
+                grams_requested = int(round(float(delta_v)))
+            if grams_requested <= 0:
+                continue
+
+            grams_effective = min(int(grams_requested), int(stock.remaining_grams))
+            if grams_effective <= 0:
+                continue
+
+            await apply_stock_delta(
+                session,
+                stock_uuid,
+                -int(grams_effective),
+                reason=f"consumption job={job.id} tray={int(tray_id)} seg={int(segment_idx)} source={source}",
+                job_id=job.id,
+                kind="consumption",
+            )
+
+            c = ConsumptionRecord(
+                job_id=job.id,
+                spool_id=None,
+                stock_id=stock_uuid,
+                tray_id=int(tray_id),
+                segment_idx=int(segment_idx),
+                grams=int(grams_effective),
+                grams_requested=int(grams_requested),
+                grams_effective=int(grams_effective),
+                source=source,
+                confidence=confidence,
+                created_at=_utcnow(),
+            )
+            session.add(c)
+            await session.flush()
 
         # Persist any snapshot updates (tray_to_stock/pending_consumptions)
         snap2 = dict(snap)
         snap2["tray_to_stock"] = tray_to_stock
-        snap2["segments_by_tray"] = segments_by_tray
         snap2["pending_consumptions"] = pending_consumptions
         # recompute pending_trays for UI
         pending_set: set[int] = set()
@@ -743,6 +586,8 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                 except Exception:
                     pass
         snap2["pending_trays"] = sorted(pending_set)
+        snap2["settled_at"] = _utcnow().isoformat()
+        snap2["settle_error"] = None
         job.spool_binding_snapshot_json = snap2
 
 
