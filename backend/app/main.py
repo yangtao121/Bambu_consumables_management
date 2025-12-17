@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import color_mappings, jobs, mappings, printers, realtime, reports, spools, stocks
+from app.api.routers import color_mappings, jobs, mappings, printers, realtime, reports, spools, stocks, trays
 from app.db.session import async_session_factory
 from app.schemas.common import Health
 from app.services.event_processor import EventProcessor
@@ -44,6 +44,7 @@ app.include_router(mappings.router)
 app.include_router(jobs.router)
 app.include_router(reports.router)
 app.include_router(realtime.router)
+app.include_router(trays.router)
 
 
 @app.get("/health", response_model=Health)

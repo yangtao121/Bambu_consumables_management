@@ -17,6 +17,11 @@ class StockCreate(BaseModel):
     rolls_count: int | None = Field(default=None, ge=0)
     remaining_grams: int | None = Field(default=None, ge=0)
 
+    # Pricing & tray (optional; backward compatible)
+    price_per_roll: float | None = Field(default=None, ge=0)
+    price_total: float | None = Field(default=None, ge=0)
+    has_tray: bool | None = None
+
     @model_validator(mode="after")
     def _validate_and_fill(self) -> "StockCreate":
         # If remaining_grams not provided, compute from rolls_count.
@@ -60,8 +65,29 @@ class StockAdjustmentCreate(BaseModel):
 
 
 class StockLedgerRow(APIModel):
+    id: UUID
     at: datetime
     grams: int
     job_id: UUID | None = None
+    note: str | None = None
+
+    # purchase/pricing fields
+    rolls_count: int | None = None
+    price_per_roll: float | None = None
+    price_total: float | None = None
+
+    # tray fields
+    has_tray: bool | None = None
+    tray_delta: int | None = None
+
+    kind: str | None = None
+
+
+class StockLedgerUpdate(BaseModel):
+    # only allow editing purchase-like rows (server-side checks will enforce)
+    rolls_count: int | None = Field(default=None, ge=0)
+    price_per_roll: float | None = Field(default=None, ge=0)
+    price_total: float | None = Field(default=None, ge=0)
+    has_tray: bool | None = None
     note: str | None = None
 

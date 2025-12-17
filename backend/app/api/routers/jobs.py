@@ -116,6 +116,7 @@ async def add_manual_consumption(job_id: UUID, body: ManualConsumptionCreate, db
         -int(grams_effective),
         reason=f"manual job={job_id} note={body.note or ''}",
         job_id=job_id,
+        kind="consumption",
     )
     await db.commit()
     return {"ok": True, "consumption_id": str(c.id), "note": body.note}
@@ -208,6 +209,7 @@ async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: Asyn
             -int(grams_effective),
             reason=f"resolve job={job_id} tray={tray_id_int} source={entry.get('source')}",
             job_id=job_id,
+            kind="consumption",
         )
 
         c = ConsumptionRecord(

@@ -26,16 +26,47 @@ const adjustmentSchema = z.object({
   reason: z.string().trim().optional()
 });
 
+const editPurchaseSchema = z.object({
+  rolls_count: z.coerce.number().int().min(0, "卷数必须 >= 0").optional(),
+  price_per_roll: z
+    .union([z.string(), z.number(), z.null(), z.undefined()])
+    .transform((v) => {
+      if (v === "" || v === null || typeof v === "undefined") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    })
+    .refine((v) => v === null || v >= 0, "卷单价必须 >= 0")
+    .optional(),
+  price_total: z
+    .union([z.string(), z.number(), z.null(), z.undefined()])
+    .transform((v) => {
+      if (v === "" || v === null || typeof v === "undefined") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    })
+    .refine((v) => v === null || v >= 0, "总价必须 >= 0")
+    .optional(),
+  has_tray: z.boolean().optional(),
+  note: z.string().trim().optional()
+});
+
 export default function Page({ params }) {
   const stockId = params?.id;
   const [stock, setStock] = useState(null);
   const [ledger, setLedger] = useState([]);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editRow, setEditRow] = useState(null);
 
   const form = useForm({
     resolver: zodResolver(adjustmentSchema),
     defaultValues: { delta_grams: 0, reason: "" }
+  });
+
+  const editForm = useForm({
+    resolver: zodResolver(editPurchaseSchema),
+    defaultValues: { rolls_count: 0, price_per_roll: null, price_total: null, has_tray: false, note: "" }
   });
 
   async function reload() {
@@ -64,6 +95,24 @@ export default function Page({ params }) {
     toast.success("已写入盘点调整");
     setOpen(false);
     form.reset({ delta_grams: 0, reason: "" });
+    await reload();
+  }
+
+  async function submitEditPurchase(values) {
+    if (!editRow?.id) return;
+    await fetchJson(`/stocks/${stockId}/ledger/${editRow.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        rolls_count: typeof values.rolls_count === "number" ? Number(values.rolls_count) : undefined,
+        price_per_roll: values.price_per_roll === null || typeof values.price_per_roll === "undefined" ? null : Number(values.price_per_roll),
+        price_total: values.price_total === null || typeof values.price_total === "undefined" ? null : Number(values.price_total),
+        has_tray: Boolean(values.has_tray),
+        note: values.note ? values.note : null
+      })
+    });
+    toast.success("已更新入库流水");
+    setEditOpen(false);
+    setEditRow(null);
     await reload();
   }
 
@@ -136,8 +185,14 @@ export default function Page({ params }) {
                 <tr className="text-left">
                   <th className="px-3 py-2">时间</th>
                   <th className="px-3 py-2">变动(g)</th>
+                  <th className="px-3 py-2">卷数</th>
+                  <th className="px-3 py-2">单价</th>
+                  <th className="px-3 py-2">总价</th>
+                  <th className="px-3 py-2">带料盘</th>
+                  <th className="px-3 py-2">料盘变动</th>
                   <th className="px-3 py-2">备注</th>
                   <th className="px-3 py-2">作业</th>
+                  <th className="px-3 py-2">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -145,13 +200,41 @@ export default function Page({ params }) {
                   <tr key={`${r.at}-${idx}`} className="border-t">
                     <td className="px-3 py-2">{fmtTime(r.at)}</td>
                     <td className="px-3 py-2 font-medium">{r.grams}</td>
+                    <td className="px-3 py-2">{typeof r.rolls_count === "number" ? r.rolls_count : "-"}</td>
+                    <td className="px-3 py-2">{typeof r.price_per_roll === "number" ? r.price_per_roll : "-"}</td>
+                    <td className="px-3 py-2">{typeof r.price_total === "number" ? r.price_total : "-"}</td>
+                    <td className="px-3 py-2">
+                      {typeof r.has_tray === "boolean" ? (r.has_tray ? "是" : "否") : "-"}
+                    </td>
+                    <td className="px-3 py-2">{typeof r.tray_delta === "number" ? r.tray_delta : "-"}</td>
                     <td className="px-3 py-2">{r.note || "-"}</td>
                     <td className="px-3 py-2">{r.job_id ? <Link className="hover:underline" href={`/jobs/${r.job_id}`}>{String(r.job_id).slice(0, 8)}…</Link> : "-"}</td>
+                    <td className="px-3 py-2">
+                      {r.job_id ? null : Number(r.grams || 0) > 0 ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setEditRow(r);
+                            editForm.reset({
+                              rolls_count: typeof r.rolls_count === "number" ? r.rolls_count : 0,
+                              price_per_roll: typeof r.price_per_roll === "number" ? r.price_per_roll : null,
+                              price_total: typeof r.price_total === "number" ? r.price_total : null,
+                              has_tray: Boolean(r.has_tray),
+                              note: r.note || ""
+                            });
+                            setEditOpen(true);
+                          }}
+                        >
+                          编辑
+                        </Button>
+                      ) : null}
+                    </td>
                   </tr>
                 ))}
                 {ledger.length === 0 ? (
                   <tr>
-                    <td colSpan={4} className="px-3 py-8 text-center text-muted-foreground">
+                    <td colSpan={12} className="px-3 py-8 text-center text-muted-foreground">
                       暂无流水
                     </td>
                   </tr>
@@ -193,6 +276,74 @@ export default function Page({ params }) {
               </Button>
               <Button type="submit" disabled={form.formState.isSubmitting}>
                 {form.formState.isSubmitting ? "提交中…" : "提交"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={editOpen}
+        onOpenChange={(v) => {
+          setEditOpen(v);
+          if (!v) setEditRow(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>编辑入库流水</DialogTitle>
+            <DialogDescription>用于补录历史价格/带料盘信息（会影响成本统计与总料盘数）。</DialogDescription>
+          </DialogHeader>
+          <form
+            className="grid gap-4"
+            onSubmit={editForm.handleSubmit(async (v) => {
+              try {
+                await submitEditPurchase(v);
+              } catch (e) {
+                toast.error(String(e?.message || e));
+              }
+            })}
+          >
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="grid gap-2">
+                <Label>卷数</Label>
+                <Input type="number" {...editForm.register("rolls_count")} />
+                {editForm.formState.errors.rolls_count ? (
+                  <div className="text-xs text-destructive">{editForm.formState.errors.rolls_count.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>卷单价（元/卷，可留空）</Label>
+                <Input type="number" step="0.01" {...editForm.register("price_per_roll")} />
+                {editForm.formState.errors.price_per_roll ? (
+                  <div className="text-xs text-destructive">{editForm.formState.errors.price_per_roll.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>总价（元，可留空）</Label>
+                <Input type="number" step="0.01" {...editForm.register("price_total")} />
+                {editForm.formState.errors.price_total ? (
+                  <div className="text-xs text-destructive">{editForm.formState.errors.price_total.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>料盘</Label>
+                <label className="flex select-none items-center gap-2 text-sm text-muted-foreground">
+                  <input type="checkbox" {...editForm.register("has_tray")} />
+                  带料盘（料盘变动 = 卷数）
+                </label>
+              </div>
+              <div className="grid gap-2 md:col-span-2">
+                <Label>备注（可选）</Label>
+                <Input {...editForm.register("note")} placeholder="例如：京东 12.12 购入" />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" disabled={editForm.formState.isSubmitting}>
+                {editForm.formState.isSubmitting ? "提交中…" : "保存"}
               </Button>
             </DialogFooter>
           </form>

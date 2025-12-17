@@ -14,7 +14,15 @@ from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.material_ledger import MaterialLedger
 from app.db.models.material_stock import MaterialStock
 from app.db.models.print_job import PrintJob
-from app.schemas.stock import StockAdjustmentCreate, StockCreate, StockCreateResult, StockLedgerRow, StockOut, StockUpdate
+from app.schemas.stock import (
+    StockAdjustmentCreate,
+    StockCreate,
+    StockCreateResult,
+    StockLedgerRow,
+    StockLedgerUpdate,
+    StockOut,
+    StockUpdate,
+)
 from app.services.stock_service import apply_stock_delta
 
 
@@ -52,6 +60,11 @@ async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) ->
     """
     now = datetime.now(timezone.utc)
     delta_grams = int(body.remaining_grams or 0)
+
+    # Optional purchase meta
+    rolls_count = int(body.rolls_count) if body.rolls_count is not None else None
+    has_tray = bool(body.has_tray) if body.has_tray is not None else None
+    tray_delta = int(rolls_count or 0) if has_tray else 0
 
     tbl = MaterialStock.__table__
     ins = insert(tbl).values(
@@ -93,6 +106,12 @@ async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) ->
                     job_id=None,
                     delta_grams=int(delta_grams),
                     reason="create+merge add via api" if merged else "create via api",
+                    kind="purchase",
+                    rolls_count=rolls_count,
+                    price_per_roll=body.price_per_roll,
+                    price_total=body.price_total,
+                    has_tray=has_tray,
+                    tray_delta=tray_delta,
                     created_at=now,
                 )
             )
@@ -187,7 +206,7 @@ async def archive_stock(
 @router.post("/{stock_id}/adjustments")
 async def create_adjustment(stock_id: UUID, body: StockAdjustmentCreate, db: AsyncSession = Depends(get_db)) -> dict:
     try:
-        await apply_stock_delta(db, stock_id, int(body.delta_grams), reason=body.reason, job_id=None)
+        await apply_stock_delta(db, stock_id, int(body.delta_grams), reason=body.reason, job_id=None, kind="adjustment")
         await db.commit()
         return {"ok": True}
     except ValueError:
@@ -206,11 +225,67 @@ async def stock_ledger(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> li
     for r in rows:
         out.append(
             StockLedgerRow(
+                id=r.id,
                 at=r.created_at,
                 grams=int(r.delta_grams),
                 job_id=r.job_id,
                 note=r.reason,
+                rolls_count=r.rolls_count,
+                price_per_roll=r.price_per_roll,
+                price_total=r.price_total,
+                has_tray=r.has_tray,
+                tray_delta=r.tray_delta,
+                kind=r.kind,
             )
         )
     return out
+
+
+@router.patch("/{stock_id}/ledger/{ledger_id}", response_model=StockLedgerRow)
+async def update_stock_ledger_row(
+    stock_id: UUID,
+    ledger_id: UUID,
+    body: StockLedgerUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> StockLedgerRow:
+    if not await db.get(MaterialStock, stock_id):
+        raise HTTPException(status_code=404, detail="stock not found")
+
+    r = await db.get(MaterialLedger, ledger_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="ledger row not found")
+    if r.stock_id != stock_id:
+        raise HTTPException(status_code=404, detail="ledger row not found for this stock")
+
+    # Only allow editing purchase-like rows (manually created, not tied to a job).
+    if r.job_id is not None or int(r.delta_grams) <= 0:
+        raise HTTPException(status_code=409, detail="only purchase ledger rows can be edited")
+
+    patch = body.model_dump(exclude_unset=True)
+    if "note" in patch:
+        r.reason = patch.pop("note")
+    for k, v in patch.items():
+        setattr(r, k, v)
+
+    # Recompute tray_delta based on has_tray + rolls_count
+    has_tray = bool(r.has_tray) if r.has_tray is not None else False
+    rolls_count = int(r.rolls_count or 0)
+    r.tray_delta = int(rolls_count) if has_tray else 0
+    r.kind = r.kind or "purchase"
+
+    await db.commit()
+    await db.refresh(r)
+    return StockLedgerRow(
+        id=r.id,
+        at=r.created_at,
+        grams=int(r.delta_grams),
+        job_id=r.job_id,
+        note=r.reason,
+        rolls_count=r.rolls_count,
+        price_per_roll=r.price_per_roll,
+        price_total=r.price_total,
+        has_tray=r.has_tray,
+        tray_delta=r.tray_delta,
+        kind=r.kind,
+    )
 

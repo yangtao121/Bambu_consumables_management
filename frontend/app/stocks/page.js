@@ -27,42 +27,74 @@ const createSchema = z.object({
   color: z.string().trim().min(1, "请输入颜色"),
   brand: z.string().trim().min(1, "请输入品牌（拓竹/其他）"),
   roll_weight_grams: z.coerce.number().int().min(1, "单卷克数必须 >= 1"),
-  rolls_count: z.coerce.number().int().min(0, "卷数必须 >= 0")
+  rolls_count: z.coerce.number().int().min(0, "卷数必须 >= 0"),
+  price_per_roll: z
+    .union([z.string(), z.number(), z.null(), z.undefined()])
+    .transform((v) => {
+      if (v === "" || v === null || typeof v === "undefined") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    })
+    .refine((v) => v === null || v >= 0, "卷单价必须 >= 0")
+    .optional(),
+  has_tray: z.boolean().optional()
 });
 
 export default function Page() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
   const [includeArchived, setIncludeArchived] = useState(false);
+  const [trayTotal, setTrayTotal] = useState(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteRefInfo, setDeleteRefInfo] = useState(null);
   const [deleting, setDeleting] = useState(false);
+  const [discardOpen, setDiscardOpen] = useState(false);
   const [colorQuery, setColorQuery] = useState("");
   const [sortKey, setSortKey] = useState("remaining"); // remaining | created | updated
   const [sortDir, setSortDir] = useState("desc"); // asc | desc
 
   const form = useForm({
     resolver: zodResolver(createSchema),
-    defaultValues: { material: "PLA", color: "白色", brand: "拓竹", roll_weight_grams: 1000, rolls_count: 1 }
+    defaultValues: {
+      material: "PLA",
+      color: "白色",
+      brand: "拓竹",
+      roll_weight_grams: 1000,
+      rolls_count: 1,
+      price_per_roll: null,
+      has_tray: false
+    }
   });
 
   const watchRollWeight = form.watch("roll_weight_grams");
   const watchRollsCount = form.watch("rolls_count");
+  const watchPricePerRoll = form.watch("price_per_roll");
   const previewAddGrams = useMemo(() => {
     const w = Number(watchRollWeight || 0);
     const n = Number(watchRollsCount || 0);
     if (!Number.isFinite(w) || !Number.isFinite(n)) return 0;
     return Math.max(0, Math.floor(w) * Math.floor(n));
   }, [watchRollWeight, watchRollsCount]);
+  const previewTotalPrice = useMemo(() => {
+    const n = Number(watchRollsCount || 0);
+    const p = watchPricePerRoll === null || typeof watchPricePerRoll === "undefined" ? null : Number(watchPricePerRoll);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    if (!Number.isFinite(p) || p < 0) return null;
+    return Math.round(p * n * 100) / 100;
+  }, [watchRollsCount, watchPricePerRoll]);
 
   async function reload(opts = {}) {
     const inc = typeof opts.includeArchived === "boolean" ? opts.includeArchived : includeArchived;
     setLoading(true);
     try {
-      const data = await fetchJson(`/stocks${inc ? "?include_archived=1" : ""}`);
+      const [data, tray] = await Promise.all([
+        fetchJson(`/stocks${inc ? "?include_archived=1" : ""}`),
+        fetchJson("/trays/summary").catch(() => null)
+      ]);
       setItems(Array.isArray(data) ? data : []);
+      setTrayTotal(tray && typeof tray.total_trays === "number" ? tray.total_trays : null);
     } finally {
       setLoading(false);
     }
@@ -135,7 +167,10 @@ export default function Page() {
         color: values.color,
         brand: values.brand,
         roll_weight_grams: Number(values.roll_weight_grams),
-        rolls_count: Number(values.rolls_count)
+        rolls_count: Number(values.rolls_count),
+        price_per_roll:
+          values.price_per_roll === null || typeof values.price_per_roll === "undefined" ? null : Number(values.price_per_roll),
+        has_tray: Boolean(values.has_tray)
       })
     });
     const stock = res?.stock ?? res;
@@ -227,6 +262,9 @@ export default function Page() {
           <Button variant="outline" onClick={reload} disabled={loading}>
             {loading ? "加载中…" : "刷新"}
           </Button>
+          <Button variant="outline" onClick={() => setDiscardOpen(true)}>
+            丢弃料盘
+          </Button>
           <Button onClick={() => setCreateOpen(true)}>新增库存</Button>
         </div>
       </div>
@@ -259,6 +297,17 @@ export default function Page() {
             ) : (
               <div className="mt-2 text-xs text-muted-foreground">当前未归档 {activeItems.length} 条</div>
             )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>总料盘</CardTitle>
+            <CardDescription>按入库（带料盘）与丢弃累计。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">{trayTotal === null ? "-" : trayTotal}</div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：个</div>
           </CardContent>
         </Card>
       </div>
@@ -364,7 +413,7 @@ export default function Page() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>新增库存</DialogTitle>
-            <DialogDescription>按「材质 + 颜色 + 品牌」录入总库存：卷数 × 单卷克数。</DialogDescription>
+            <DialogDescription>按「材质 + 颜色 + 品牌」录入总库存：卷数 × 单卷克数。可选录入卷单价与是否带料盘。</DialogDescription>
           </DialogHeader>
 
           <form
@@ -421,6 +470,20 @@ export default function Page() {
                   <div className="text-xs text-destructive">{form.formState.errors.rolls_count.message}</div>
                 ) : null}
               </div>
+              <div className="grid gap-2">
+                <Label>卷单价（元/卷，可选）</Label>
+                <Input type="number" step="0.01" {...form.register("price_per_roll")} placeholder="例如：41" />
+                {form.formState.errors.price_per_roll ? (
+                  <div className="text-xs text-destructive">{form.formState.errors.price_per_roll.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>料盘</Label>
+                <label className="flex select-none items-center gap-2 text-sm text-muted-foreground">
+                  <input type="checkbox" {...form.register("has_tray")} />
+                  本次入库带料盘（料盘数 + 卷数）
+                </label>
+              </div>
             </div>
 
             <div className="rounded-md border p-3 text-sm">
@@ -428,6 +491,11 @@ export default function Page() {
               <div className="mt-1 text-muted-foreground">
                 约 <span className="font-medium text-foreground">{previewAddGrams}</span> g（卷数 × 单卷克数）。如遇同材质/颜色/品牌已存在，将自动合并累加。
               </div>
+              {previewTotalPrice !== null ? (
+                <div className="mt-1 text-muted-foreground">
+                  预估总价：<span className="font-medium text-foreground">{previewTotalPrice}</span> 元（仅用于后续折合成本统计）。
+                </div>
+              ) : null}
             </div>
 
             <DialogFooter>
@@ -437,6 +505,54 @@ export default function Page() {
               <Button type="submit" disabled={form.formState.isSubmitting}>
                 {form.formState.isSubmitting ? "提交中…" : "新增"}
               </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={discardOpen} onOpenChange={setDiscardOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>丢弃料盘</DialogTitle>
+            <DialogDescription>丢弃只影响“总料盘数”，不影响任何库存克数与消耗。</DialogDescription>
+          </DialogHeader>
+          <form
+            className="grid gap-4"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              const count = Number(fd.get("count") || 0);
+              const note = String(fd.get("note") || "").trim();
+              if (!Number.isFinite(count) || count <= 0) {
+                toast.error("请输入要丢弃的料盘数量（>=1）");
+                return;
+              }
+              try {
+                await fetchJson("/trays/discard", {
+                  method: "POST",
+                  body: JSON.stringify({ count: Math.floor(count), note: note ? note : null })
+                });
+                toast.success("已记录丢弃料盘");
+                setDiscardOpen(false);
+                await reload();
+              } catch (err) {
+                toast.error(String(err?.message || err));
+              }
+            }}
+          >
+            <div className="grid gap-2">
+              <Label>丢弃数量 *</Label>
+              <Input name="count" type="number" min="1" placeholder="例如：1" />
+            </div>
+            <div className="grid gap-2">
+              <Label>备注（可选）</Label>
+              <Input name="note" placeholder="例如：坏了/丢了" />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setDiscardOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit">提交</Button>
             </DialogFooter>
           </form>
         </DialogContent>

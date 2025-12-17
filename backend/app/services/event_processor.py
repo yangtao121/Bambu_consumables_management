@@ -710,6 +710,7 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                     -int(grams_effective),
                     reason=f"consumption job={job.id} tray={int(tray_id)} seg={int(segment_idx)} source={source}",
                     job_id=job.id,
+                    kind="consumption",
                 )
 
                 c = ConsumptionRecord(

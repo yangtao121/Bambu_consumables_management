@@ -19,6 +19,7 @@ async def apply_stock_delta(
     delta_grams: int,
     reason: str | None = None,
     job_id: UUID | None = None,
+    kind: str | None = None,
 ) -> MaterialStock:
     s = await session.get(MaterialStock, stock_id)
     if not s:
@@ -37,6 +38,7 @@ async def apply_stock_delta(
         job_id=job_id,
         delta_grams=int(effective_delta),
         reason=reason,
+        kind=kind,
         created_at=_utcnow(),
     )
     session.add(led)
