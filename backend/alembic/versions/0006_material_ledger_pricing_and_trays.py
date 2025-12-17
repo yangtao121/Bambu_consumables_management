@@ -1,6 +1,6 @@
 """material ledger pricing and trays (backward compatible)
 
-Revision ID: 0006_material_ledger_pricing_and_trays
+Revision ID: 0006_ledger_price_tray
 Revises: 0005_consumption_record_segments
 Create Date: 2025-12-17
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import alembic.op as op
 import sqlalchemy as sa
 
-revision = "0006_material_ledger_pricing_and_trays"
+revision = "0006_ledger_price_tray"
 down_revision = "0005_consumption_record_segments"
 branch_labels = None
 depends_on = None
