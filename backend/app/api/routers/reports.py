@@ -86,7 +86,11 @@ async def _compute_daily_cost(
     consumption_rows = (
         await db.execute(
             select(ConsumptionRecord)
-            .where(ConsumptionRecord.stock_id.is_not(None), ConsumptionRecord.created_at < end_dt)
+            .where(
+                ConsumptionRecord.stock_id.is_not(None),
+                ConsumptionRecord.created_at < end_dt,
+                ConsumptionRecord.voided_at.is_(None),
+            )
             .order_by(ConsumptionRecord.created_at.asc(), ConsumptionRecord.id.asc())
         )
     ).scalars().all()

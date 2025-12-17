@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from fastapi import HTTPException
 from sqlalchemy import func, select
 
 _backend_root = Path(__file__).resolve().parents[1]
@@ -16,6 +17,8 @@ _default_pythonpath = "/app" if Path("/app/app").exists() else str(_backend_root
 sys.path.insert(0, os.getenv("PYTHONPATH") or _default_pythonpath)
 
 from app.api.routers.jobs import resolve_job_materials
+from app.api.routers.jobs import add_manual_consumption, void_manual_job_consumption
+from app.api.routers.stocks import add_manual_stock_consumption, void_manual_stock_consumption, void_stock_ledger_row, update_stock
 from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.material_ledger import MaterialLedger
 from app.db.models.material_stock import MaterialStock
@@ -23,8 +26,10 @@ from app.db.models.normalized_event import NormalizedEvent
 from app.db.models.printer import Printer
 from app.db.models.print_job import PrintJob
 from app.db.session import async_session_factory
-from app.schemas.job import JobMaterialResolve, JobMaterialResolveItem
+from app.schemas.job import JobMaterialResolve, JobMaterialResolveItem, ManualConsumptionCreate, ManualConsumptionVoid
+from app.schemas.stock import StockManualConsumptionCreate, StockUpdate, VoidRequest
 from app.services.event_processor import process_event
+from app.services.stock_service import apply_stock_delta
 
 
 def _utcnow() -> datetime:
@@ -89,6 +94,24 @@ async def _create_printer(session, alias: str) -> Printer:
     session.add(p)
     await session.flush()
     return p
+
+
+async def _create_job(session, *, printer_id: uuid.UUID, job_key: str = "manual-job", file_name: str = "manual.gcode") -> PrintJob:
+    now = _utcnow()
+    j = PrintJob(
+        printer_id=printer_id,
+        job_key=job_key,
+        file_name=file_name,
+        status="manual",
+        started_at=now,
+        ended_at=None,
+        spool_binding_snapshot_json={},
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(j)
+    await session.flush()
+    return j
 
 
 async def _create_stock(
@@ -734,6 +757,127 @@ async def t7_clamp_to_zero_consistent() -> None:
         await session.commit()
 
 
+async def t9_manual_stock_consumption_void_roundtrip() -> None:
+    async with async_session_factory() as session:
+        p = await _create_printer(session, "T9")
+        color = f"白色-{uuid.uuid4().hex[:6]}"
+        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=1000)
+        await session.commit()
+
+        before = int(s.remaining_grams)
+        res = await add_manual_stock_consumption(
+            s.id, StockManualConsumptionCreate(grams=200, note="t9"), db=session
+        )
+        cid = uuid.UUID(str(res["consumption_id"]))
+
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before - 200
+
+        await void_manual_stock_consumption(s.id, cid, VoidRequest(reason="t9 void"), db=session)
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before
+
+        c = await session.get(ConsumptionRecord, cid)
+        assert c is not None
+        assert c.voided_at is not None
+        await session.commit()
+
+
+async def t10_void_adjustment_safety() -> None:
+    async with async_session_factory() as session:
+        _p = await _create_printer(session, "T10")
+        color = f"黑色-{uuid.uuid4().hex[:6]}"
+        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=500)
+        await session.commit()
+
+        before = int(s.remaining_grams)
+        # Create an adjustment +120g
+        await apply_stock_delta(session, s.id, +120, reason="t10 adjustment", job_id=None, kind="adjustment")
+        await session.commit()
+
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before + 120
+
+        r = (
+            (await session.execute(select(MaterialLedger).where(MaterialLedger.stock_id == s.id, MaterialLedger.kind == "adjustment").order_by(MaterialLedger.created_at.desc())))
+        ).scalars().first()
+        assert r is not None
+
+        await void_stock_ledger_row(s.id, r.id, VoidRequest(reason="t10 void"), db=session)
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before
+
+        r2 = await session.get(MaterialLedger, r.id)
+        assert r2 is not None and r2.voided_at is not None
+        rev = (
+            (await session.execute(select(MaterialLedger).where(MaterialLedger.reversal_of_id == r.id).order_by(MaterialLedger.created_at.desc())))
+        ).scalars().first()
+        assert rev is not None
+        await session.commit()
+
+        # Unsafe reversal should be blocked if adjustment grams were consumed.
+        s2 = await _create_stock(session, material="PLA", color=f"灰-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=50)
+        await apply_stock_delta(session, s2.id, +100, reason="t10 adj2", job_id=None, kind="adjustment")
+        await session.commit()
+        # Consume most of it
+        await add_manual_stock_consumption(s2.id, StockManualConsumptionCreate(grams=120, note="consume"), db=session)
+        await session.refresh(s2)
+        assert int(s2.remaining_grams) < 100
+        r_adj2 = (
+            (await session.execute(select(MaterialLedger).where(MaterialLedger.stock_id == s2.id, MaterialLedger.kind == "adjustment").order_by(MaterialLedger.created_at.desc())))
+        ).scalars().first()
+        assert r_adj2 is not None
+        try:
+            await void_stock_ledger_row(s2.id, r_adj2.id, VoidRequest(reason="should fail"), db=session)
+            raise AssertionError("expected void to be blocked")
+        except HTTPException as e:
+            assert int(e.status_code) == 409
+        except Exception as e:
+            assert "cannot void" in str(e) or "409" in str(e)
+
+
+async def t11_stock_rename_merge() -> None:
+    async with async_session_factory() as session:
+        _p = await _create_printer(session, "T11")
+        a = await _create_stock(session, material="PLA", color=f"白-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=400)
+        b = await _create_stock(session, material="PLA", color="合并色", brand="拓竹", remaining_grams=100)
+        await session.commit()
+
+        res = await update_stock(
+            a.id,
+            StockUpdate(material=b.material, color=b.color, brand=b.brand, roll_weight_grams=b.roll_weight_grams),
+            merge=True,
+            db=session,
+        )
+        assert res is not None
+        await session.refresh(b)
+        assert int(b.remaining_grams) == 500
+        await session.refresh(a)
+        assert bool(a.is_archived) is True
+        await session.commit()
+
+
+async def t12_job_manual_consumption_void() -> None:
+    async with async_session_factory() as session:
+        p = await _create_printer(session, "T12")
+        j = await _create_job(session, printer_id=p.id, job_key=f"MANUAL-{uuid.uuid4()}")
+        s = await _create_stock(session, material="PLA", color=f"红-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=300)
+        await session.commit()
+
+        before = int(s.remaining_grams)
+        res = await add_manual_consumption(j.id, ManualConsumptionCreate(stock_id=s.id, grams=120, note="t12"), db=session)
+        cid = uuid.UUID(str(res["consumption_id"]))
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before - 120
+
+        await void_manual_job_consumption(j.id, cid, ManualConsumptionVoid(reason="t12 void"), db=session)
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before
+        c = await session.get(ConsumptionRecord, cid)
+        assert c is not None and c.voided_at is not None
+        await session.commit()
+
+
 async def main() -> None:
     tests = [
         ("T1 refresh no deduct", t1_ams_refresh_no_deduct),
@@ -744,6 +888,10 @@ async def main() -> None:
         ("T6 pending resolve repeat", t6_pending_resolve_repeat_idempotent),
         ("T7 clamp to zero", t7_clamp_to_zero_consistent),
         ("T8 StateChanged FINISH still settles", t8_state_changed_finish_still_settles),
+        ("T9 manual stock consumption void", t9_manual_stock_consumption_void_roundtrip),
+        ("T10 void adjustment safety", t10_void_adjustment_safety),
+        ("T11 stock rename merge", t11_stock_rename_merge),
+        ("T12 job manual consumption void", t12_job_manual_consumption_void),
     ]
 
     fails: list[str] = []

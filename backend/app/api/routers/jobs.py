@@ -12,7 +12,7 @@ from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.material_stock import MaterialStock
 from app.db.models.print_job import PrintJob
 from app.db.models.spool import Spool
-from app.schemas.job import JobConsumptionOut, JobMaterialResolve, JobOut, ManualConsumptionCreate
+from app.schemas.job import JobConsumptionOut, JobMaterialResolve, JobOut, ManualConsumptionCreate, ManualConsumptionVoid
 from app.services.stock_service import apply_stock_delta
 
 
@@ -76,6 +76,8 @@ async def list_job_consumptions(job_id: UUID, db: AsyncSession = Depends(get_db)
                 source=c.source,
                 confidence=c.confidence,
                 created_at=c.created_at,
+                voided_at=getattr(c, "voided_at", None),
+                void_reason=getattr(c, "void_reason", None),
             )
         )
     return out
@@ -114,12 +116,53 @@ async def add_manual_consumption(job_id: UUID, body: ManualConsumptionCreate, db
         db,
         body.stock_id,
         -int(grams_effective),
-        reason=f"manual job={job_id} note={body.note or ''}",
+        reason=f"manual consumption={c.id} job={job_id} note={body.note or ''}",
         job_id=job_id,
         kind="consumption",
     )
     await db.commit()
     return {"ok": True, "consumption_id": str(c.id), "note": body.note}
+
+
+@router.post("/{job_id}/consumptions/{consumption_id}/void")
+async def void_manual_job_consumption(
+    job_id: UUID,
+    consumption_id: UUID,
+    body: ManualConsumptionVoid,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    j = await db.get(PrintJob, job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    c = await db.get(ConsumptionRecord, consumption_id)
+    if not c or c.job_id != job_id:
+        raise HTTPException(status_code=404, detail="consumption not found")
+    if getattr(c, "voided_at", None) is not None:
+        raise HTTPException(status_code=409, detail="consumption already voided")
+    if str(c.source or "") != "manual":
+        raise HTTPException(status_code=409, detail="only manual consumptions can be voided")
+    if c.stock_id is None:
+        raise HTTPException(status_code=409, detail="manual consumption missing stock_id")
+
+    grams = int(getattr(c, "grams_effective", None) or getattr(c, "grams") or 0)
+    if grams <= 0:
+        raise HTTPException(status_code=409, detail="invalid consumption grams")
+
+    now = datetime.now(timezone.utc)
+    c.voided_at = now
+    c.void_reason = body.reason
+
+    await apply_stock_delta(
+        db,
+        c.stock_id,
+        +int(grams),
+        reason=f"void manual job={job_id} consumption={consumption_id} note={body.reason or ''}",
+        job_id=job_id,
+        kind="reversal",
+    )
+    await db.commit()
+    return {"ok": True}
 
 
 @router.post("/{job_id}/materials/resolve")

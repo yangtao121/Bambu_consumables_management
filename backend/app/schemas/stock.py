@@ -70,6 +70,9 @@ class StockLedgerRow(APIModel):
     grams: int
     job_id: UUID | None = None
     note: str | None = None
+    voided_at: datetime | None = None
+    void_reason: str | None = None
+    reversal_of_id: UUID | None = None
 
     # purchase/pricing fields
     rolls_count: int | None = None
@@ -90,4 +93,13 @@ class StockLedgerUpdate(BaseModel):
     price_total: float | None = Field(default=None, ge=0)
     has_tray: bool | None = None
     note: str | None = None
+
+
+class StockManualConsumptionCreate(BaseModel):
+    grams: int = Field(ge=0)
+    note: str | None = None
+
+
+class VoidRequest(BaseModel):
+    reason: str | None = None
 

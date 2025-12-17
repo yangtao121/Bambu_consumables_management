@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -50,6 +51,22 @@ const editPurchaseSchema = z.object({
   note: z.string().trim().optional()
 });
 
+const manualStockConsumptionSchema = z.object({
+  grams: z.coerce.number().int().min(1, "克数必须 >= 1"),
+  note: z.string().trim().optional()
+});
+
+const editStockSchema = z.object({
+  material: z.string().trim().min(1, "请输入材质"),
+  color: z.string().trim().min(1, "请输入颜色"),
+  brand: z.string().trim().min(1, "请输入品牌"),
+  roll_weight_grams: z.coerce.number().int().min(1, "单卷克数必须 >= 1")
+});
+
+const voidSchema = z.object({
+  reason: z.string().trim().optional()
+});
+
 function round2(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return null;
@@ -64,6 +81,7 @@ function fmtMoney(n) {
 
 export default function Page({ params }) {
   const stockId = params?.id;
+  const router = useRouter();
   const [stock, setStock] = useState(null);
   const [ledger, setLedger] = useState([]);
   const [valuation, setValuation] = useState(null);
@@ -72,6 +90,10 @@ export default function Page({ params }) {
   const [editOpen, setEditOpen] = useState(false);
   const [editRow, setEditRow] = useState(null);
   const [lastPriceEdited, setLastPriceEdited] = useState(null); // "per_roll" | "total" | null
+  const [manualOpen, setManualOpen] = useState(false);
+  const [editStockOpen, setEditStockOpen] = useState(false);
+  const [voidOpen, setVoidOpen] = useState(false);
+  const [voidTarget, setVoidTarget] = useState(null); // { kind: "adjustment"|"manual_stock_consumption", row }
 
   const form = useForm({
     resolver: zodResolver(adjustmentSchema),
@@ -81,6 +103,21 @@ export default function Page({ params }) {
   const editForm = useForm({
     resolver: zodResolver(editPurchaseSchema),
     defaultValues: { rolls_count: 0, price_per_roll: null, price_total: null, has_tray: false, note: "" }
+  });
+
+  const manualForm = useForm({
+    resolver: zodResolver(manualStockConsumptionSchema),
+    defaultValues: { grams: 0, note: "" }
+  });
+
+  const editStockForm = useForm({
+    resolver: zodResolver(editStockSchema),
+    defaultValues: { material: "", color: "", brand: "", roll_weight_grams: 1000 }
+  });
+
+  const voidForm = useForm({
+    resolver: zodResolver(voidSchema),
+    defaultValues: { reason: "" }
   });
 
   const watchEditRolls = editForm.watch("rolls_count");
@@ -123,6 +160,12 @@ export default function Page({ params }) {
 
   const totalDelta = useMemo(() => ledger.reduce((acc, r) => acc + Number(r.grams || 0), 0), [ledger]);
 
+  function parseConsumptionIdFromNote(note) {
+    const s = String(note || "");
+    const m = s.match(/consumption=([0-9a-fA-F-]{36})/);
+    return m ? m[1] : null;
+  }
+
   async function submitAdjustment(values) {
     await fetchJson(`/stocks/${stockId}/adjustments`, {
       method: "POST",
@@ -152,6 +195,83 @@ export default function Page({ params }) {
     await reload();
   }
 
+  async function submitManualConsumption(values) {
+    await fetchJson(`/stocks/${stockId}/consumptions`, {
+      method: "POST",
+      body: JSON.stringify({ grams: Number(values.grams), note: values.note ? values.note : null })
+    });
+    toast.success("已写入手工扣料");
+    setManualOpen(false);
+    manualForm.reset({ grams: 0, note: "" });
+    await reload();
+  }
+
+  async function submitEditStock(values) {
+    try {
+      const res = await fetchJson(`/stocks/${stockId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          material: values.material,
+          color: values.color,
+          brand: values.brand,
+          roll_weight_grams: Number(values.roll_weight_grams)
+        })
+      });
+      toast.success("库存项已更新");
+      setEditStockOpen(false);
+      await reload();
+      return res;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409 && e.detail && typeof e.detail === "object") {
+        const msg = String(e.detail?.message || "");
+        if (msg === "stock key conflict") {
+          const ok = window.confirm("该材质/颜色/品牌已存在其他库存项。是否合并到现有库存？（将迁移剩余克数并归档当前库存项）");
+          if (!ok) throw e;
+          const merged = await fetchJson(`/stocks/${stockId}?merge=1`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              material: values.material,
+              color: values.color,
+              brand: values.brand,
+              roll_weight_grams: Number(values.roll_weight_grams)
+            })
+          });
+          toast.success("已合并到现有库存项");
+          setEditStockOpen(false);
+          if (merged?.id && String(merged.id) !== String(stockId)) {
+            router.push(`/stocks/${merged.id}`);
+            return merged;
+          }
+          await reload();
+          return merged;
+        }
+      }
+      throw e;
+    }
+  }
+
+  async function submitVoid(values) {
+    if (!voidTarget) return;
+    const reason = values.reason ? values.reason : null;
+    if (voidTarget.kind === "adjustment") {
+      await fetchJson(`/stocks/${stockId}/ledger/${voidTarget.row.id}/void`, {
+        method: "POST",
+        body: JSON.stringify({ reason })
+      });
+      toast.success("已撤销调整");
+    } else if (voidTarget.kind === "manual_stock_consumption") {
+      await fetchJson(`/stocks/${stockId}/consumptions/${voidTarget.consumptionId}/void`, {
+        method: "POST",
+        body: JSON.stringify({ reason })
+      });
+      toast.success("已撤销扣料");
+    }
+    setVoidOpen(false);
+    setVoidTarget(null);
+    voidForm.reset({ reason: "" });
+    await reload();
+  }
+
   if (!stockId) return null;
 
   return (
@@ -171,6 +291,21 @@ export default function Page({ params }) {
         <div className="flex items-center gap-2">
           <Button variant="outline" onClick={reload} disabled={loading}>
             {loading ? "加载中…" : "刷新"}
+          </Button>
+          <Button variant="outline" onClick={() => {
+            if (!stock) return;
+            editStockForm.reset({
+              material: stock.material || "",
+              color: stock.color || "",
+              brand: stock.brand || "",
+              roll_weight_grams: Number(stock.roll_weight_grams || 1000)
+            });
+            setEditStockOpen(true);
+          }}>
+            编辑库存项
+          </Button>
+          <Button variant="outline" onClick={() => setManualOpen(true)}>
+            手工扣料
           </Button>
           <Button onClick={() => setOpen(true)}>盘点调整</Button>
         </div>
@@ -294,10 +429,50 @@ export default function Page({ params }) {
                       {typeof r.has_tray === "boolean" ? (r.has_tray ? "是" : "否") : "-"}
                     </td>
                     <td className="px-3 py-2">{typeof r.tray_delta === "number" ? r.tray_delta : "-"}</td>
-                    <td className="px-3 py-2">{r.note || "-"}</td>
+                    <td className="px-3 py-2">
+                      {r.voided_at ? (
+                        <div>
+                          <div className="text-xs text-destructive">已作废</div>
+                          <div className="text-xs text-muted-foreground">
+                            {fmtTime(r.voided_at)}{r.void_reason ? ` · ${r.void_reason}` : ""}
+                          </div>
+                          <div className="text-xs text-muted-foreground">{r.note || "-"}</div>
+                        </div>
+                      ) : (
+                        r.note || "-"
+                      )}
+                    </td>
                     <td className="px-3 py-2">{r.job_id ? <Link className="hover:underline" href={`/jobs/${r.job_id}`}>{String(r.job_id).slice(0, 8)}…</Link> : "-"}</td>
                     <td className="px-3 py-2">
-                      {r.job_id ? null : Number(r.grams || 0) > 0 ? (
+                      {r.voided_at ? null : r.job_id ? null : (r.kind === "adjustment") ? (
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => {
+                            setVoidTarget({ kind: "adjustment", row: r });
+                            voidForm.reset({ reason: "" });
+                            setVoidOpen(true);
+                          }}
+                        >
+                          撤销
+                        </Button>
+                      ) : (r.kind === "consumption" && String(r.note || "").includes("manual_stock")) ? (() => {
+                        const cid = parseConsumptionIdFromNote(r.note);
+                        if (!cid) return null;
+                        return (
+                          <Button
+                            variant="destructive"
+                            size="sm"
+                            onClick={() => {
+                              setVoidTarget({ kind: "manual_stock_consumption", row: r, consumptionId: cid });
+                              voidForm.reset({ reason: "" });
+                              setVoidOpen(true);
+                            }}
+                          >
+                            撤销
+                          </Button>
+                        );
+                      })() : Number(r.grams || 0) > 0 ? (
                         <Button
                           variant="outline"
                           size="sm"
@@ -368,6 +543,107 @@ export default function Page({ params }) {
               </Button>
               <Button type="submit" disabled={form.formState.isSubmitting}>
                 {form.formState.isSubmitting ? "提交中…" : "提交"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={manualOpen} onOpenChange={setManualOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>手工扣料（按库存）</DialogTitle>
+            <DialogDescription>用于不关联 Job 的手工扣减。将写入扣料记录并同步写入库存流水。</DialogDescription>
+          </DialogHeader>
+          <form
+            className="grid gap-4"
+            onSubmit={manualForm.handleSubmit(async (v) => {
+              try {
+                await submitManualConsumption(v);
+              } catch (e) {
+                toast.error(String(e?.message || e));
+              }
+            })}
+          >
+            <div className="grid gap-2">
+              <Label>克数</Label>
+              <Input type="number" {...manualForm.register("grams")} />
+              {manualForm.formState.errors.grams ? (
+                <div className="text-xs text-destructive">{manualForm.formState.errors.grams.message}</div>
+              ) : null}
+            </div>
+            <div className="grid gap-2">
+              <Label>备注（可选）</Label>
+              <Input {...manualForm.register("note")} placeholder="例如：手工估算 23g" />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setManualOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" disabled={manualForm.formState.isSubmitting}>
+                {manualForm.formState.isSubmitting ? "提交中…" : "提交"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editStockOpen} onOpenChange={setEditStockOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>编辑库存项</DialogTitle>
+            <DialogDescription>可修改材质/颜色/品牌/单卷克数。若目标 key 已存在，会提示是否合并。</DialogDescription>
+          </DialogHeader>
+          <form
+            className="grid gap-4"
+            onSubmit={editStockForm.handleSubmit(async (v) => {
+              try {
+                await submitEditStock(v);
+              } catch (e) {
+                if (e instanceof ApiError && e.detail && typeof e.detail === "object" && typeof e.detail.message === "string") {
+                  toast.error(e.detail.message);
+                } else {
+                  toast.error(String(e?.message || e));
+                }
+              }
+            })}
+          >
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="grid gap-2">
+                <Label>材质 *</Label>
+                <Input {...editStockForm.register("material")} />
+                {editStockForm.formState.errors.material ? (
+                  <div className="text-xs text-destructive">{editStockForm.formState.errors.material.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>颜色 *</Label>
+                <Input {...editStockForm.register("color")} />
+                {editStockForm.formState.errors.color ? (
+                  <div className="text-xs text-destructive">{editStockForm.formState.errors.color.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>品牌 *</Label>
+                <Input {...editStockForm.register("brand")} />
+                {editStockForm.formState.errors.brand ? (
+                  <div className="text-xs text-destructive">{editStockForm.formState.errors.brand.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>单卷克数 *</Label>
+                <Input type="number" {...editStockForm.register("roll_weight_grams")} />
+                {editStockForm.formState.errors.roll_weight_grams ? (
+                  <div className="text-xs text-destructive">{editStockForm.formState.errors.roll_weight_grams.message}</div>
+                ) : null}
+              </div>
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setEditStockOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" disabled={editStockForm.formState.isSubmitting}>
+                {editStockForm.formState.isSubmitting ? "保存中…" : "保存"}
               </Button>
             </DialogFooter>
           </form>
@@ -452,6 +728,48 @@ export default function Page({ params }) {
               </Button>
               <Button type="submit" disabled={editForm.formState.isSubmitting}>
                 {editForm.formState.isSubmitting ? "提交中…" : "保存"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={voidOpen}
+        onOpenChange={(v) => {
+          setVoidOpen(v);
+          if (!v) setVoidTarget(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>撤销记录</DialogTitle>
+            <DialogDescription>撤销会保留审计记录，并写入一条反向流水回滚库存。</DialogDescription>
+          </DialogHeader>
+          <form
+            className="grid gap-4"
+            onSubmit={voidForm.handleSubmit(async (v) => {
+              try {
+                await submitVoid(v);
+              } catch (e) {
+                if (e instanceof ApiError && e.detail && typeof e.detail === "object" && typeof e.detail.message === "string") {
+                  toast.error(e.detail.message);
+                } else {
+                  toast.error(String(e?.message || e));
+                }
+              }
+            })}
+          >
+            <div className="grid gap-2">
+              <Label>原因（可选）</Label>
+              <Input {...voidForm.register("reason")} placeholder="例如：误操作" />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setVoidOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" variant="destructive" disabled={voidForm.formState.isSubmitting}>
+                {voidForm.formState.isSubmitting ? "处理中…" : "确认撤销"}
               </Button>
             </DialogFooter>
           </form>

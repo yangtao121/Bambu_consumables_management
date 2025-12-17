@@ -27,9 +27,13 @@ class ManualConsumptionCreate(BaseModel):
     note: str | None = None
 
 
+class ManualConsumptionVoid(BaseModel):
+    reason: str | None = None
+
+
 class JobConsumptionOut(APIModel):
     id: UUID
-    job_id: UUID
+    job_id: UUID | None = None
     tray_id: int | None = None
     stock_id: UUID | None = None
     material: str | None = None
@@ -46,6 +50,8 @@ class JobConsumptionOut(APIModel):
     source: str
     confidence: str
     created_at: datetime
+    voided_at: datetime | None = None
+    void_reason: str | None = None
 
 
 class JobMaterialResolveItem(BaseModel):

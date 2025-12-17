@@ -38,9 +38,15 @@ class MaterialLedger(Base):
     kind: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    void_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reversal_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("material_ledger.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 Index("ix_material_ledger_stock_id", MaterialLedger.stock_id)
 Index("ix_material_ledger_job_id", MaterialLedger.job_id)
 Index("ix_material_ledger_created_at", MaterialLedger.created_at)
+Index("ix_material_ledger_reversal_of_id", MaterialLedger.reversal_of_id)
 

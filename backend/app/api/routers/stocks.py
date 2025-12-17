@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Text, cast, func, literal_column, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
@@ -20,8 +21,10 @@ from app.schemas.stock import (
     StockCreateResult,
     StockLedgerRow,
     StockLedgerUpdate,
+    StockManualConsumptionCreate,
     StockOut,
     StockUpdate,
+    VoidRequest,
 )
 from app.services.pricing_service import (
     PricingConflict,
@@ -246,13 +249,107 @@ async def get_stock(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> Mater
 
 
 @router.patch("/{stock_id}", response_model=StockOut)
-async def update_stock(stock_id: UUID, body: StockUpdate, db: AsyncSession = Depends(get_db)) -> MaterialStock:
+async def update_stock(
+    stock_id: UUID,
+    body: StockUpdate,
+    merge: bool = Query(default=False, description="If key conflicts, merge remaining grams into existing active stock"),
+    db: AsyncSession = Depends(get_db),
+) -> MaterialStock:
     s = await db.get(MaterialStock, stock_id)
     if not s:
         raise HTTPException(status_code=404, detail="stock not found")
-    for k, v in body.model_dump(exclude_unset=True).items():
+
+    patch = body.model_dump(exclude_unset=True)
+    now = datetime.now(timezone.utc)
+
+    # Detect potential key change (material+color+brand)
+    new_material = patch.get("material", s.material)
+    new_color = patch.get("color", s.color)
+    new_brand = patch.get("brand", s.brand)
+    key_changed = (new_material, new_color, new_brand) != (s.material, s.color, s.brand)
+
+    if key_changed:
+        # If a different active stock already owns the target key, optionally merge into it.
+        target = (
+            await db.execute(
+                select(MaterialStock).where(
+                    MaterialStock.material == new_material,
+                    MaterialStock.color == new_color,
+                    MaterialStock.brand == new_brand,
+                    MaterialStock.is_archived.is_(False),
+                    MaterialStock.id != stock_id,
+                )
+            )
+        ).scalars().first()
+
+        if target is not None and merge:
+            grams_to_move = int(getattr(s, "remaining_grams") or 0)
+            if grams_to_move > 0:
+                await apply_stock_delta(
+                    db,
+                    target.id,
+                    +int(grams_to_move),
+                    reason=f"merge_in from={stock_id}",
+                    job_id=None,
+                    kind="merge_in",
+                )
+                await apply_stock_delta(
+                    db,
+                    s.id,
+                    -int(grams_to_move),
+                    reason=f"merge_out to={target.id}",
+                    job_id=None,
+                    kind="merge_out",
+                )
+
+            # Optional: allow changing roll weight as part of the merge action (applies to target)
+            if "roll_weight_grams" in patch and patch["roll_weight_grams"] is not None:
+                target.roll_weight_grams = int(patch["roll_weight_grams"])
+                target.updated_at = now
+
+            # Archive source stock after merging remaining grams
+            s.is_archived = True
+            s.archived_at = now
+            s.updated_at = now
+
+            await db.commit()
+            await db.refresh(target)
+            return target
+
+        # No merge (or no conflict target): attempt in-place update; on conflict, surface 409 with target info.
+        for k, v in patch.items():
+            setattr(s, k, v)
+        s.updated_at = now
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            conflict = (
+                await db.execute(
+                    select(MaterialStock).where(
+                        MaterialStock.material == new_material,
+                        MaterialStock.color == new_color,
+                        MaterialStock.brand == new_brand,
+                        MaterialStock.is_archived.is_(False),
+                    )
+                )
+            ).scalars().first()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "stock key conflict",
+                    "conflict_stock_id": str(conflict.id) if conflict else None,
+                    "key": {"material": new_material, "color": new_color, "brand": new_brand},
+                },
+            )
+
+        await db.refresh(s)
+        return s
+
+    # No key change: normal patch
+    for k, v in patch.items():
         setattr(s, k, v)
-    s.updated_at = datetime.now(timezone.utc)
+    s.updated_at = now
     await db.commit()
     await db.refresh(s)
     return s
@@ -341,6 +438,9 @@ async def stock_ledger(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> li
                 grams=int(r.delta_grams),
                 job_id=r.job_id,
                 note=r.reason,
+                voided_at=getattr(r, "voided_at", None),
+                void_reason=getattr(r, "void_reason", None),
+                reversal_of_id=getattr(r, "reversal_of_id", None),
                 rolls_count=r.rolls_count,
                 price_per_roll=derived_ppr,
                 price_total=derived_total,
@@ -432,6 +532,9 @@ async def update_stock_ledger_row(
         grams=int(r.delta_grams),
         job_id=r.job_id,
         note=r.reason,
+        voided_at=getattr(r, "voided_at", None),
+        void_reason=getattr(r, "void_reason", None),
+        reversal_of_id=getattr(r, "reversal_of_id", None),
         rolls_count=r.rolls_count,
         price_per_roll=derive_missing_price_per_roll(
             rolls_count=r.rolls_count, price_per_roll=r.price_per_roll, price_total=r.price_total
@@ -443,4 +546,137 @@ async def update_stock_ledger_row(
         tray_delta=r.tray_delta,
         kind=r.kind,
     )
+
+
+@router.post("/{stock_id}/consumptions")
+async def add_manual_stock_consumption(
+    stock_id: UUID,
+    body: StockManualConsumptionCreate,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    st = await db.get(MaterialStock, stock_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="stock not found")
+
+    grams_requested = int(body.grams)
+    grams_effective = min(int(grams_requested), int(st.remaining_grams))
+    if grams_effective <= 0:
+        raise HTTPException(status_code=409, detail="stock has no remaining grams")
+
+    c = ConsumptionRecord(
+        job_id=None,
+        spool_id=None,
+        stock_id=stock_id,
+        tray_id=None,
+        segment_idx=None,
+        grams=int(grams_effective),
+        grams_requested=int(grams_requested),
+        grams_effective=int(grams_effective),
+        source="manual_stock",
+        confidence="high",
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(c)
+    await db.flush()
+
+    await apply_stock_delta(
+        db,
+        stock_id,
+        -int(grams_effective),
+        reason=f"manual_stock consumption={c.id} note={body.note or ''}",
+        job_id=None,
+        kind="consumption",
+    )
+    await db.commit()
+    return {"ok": True, "consumption_id": str(c.id), "note": body.note}
+
+
+@router.post("/{stock_id}/consumptions/{consumption_id}/void")
+async def void_manual_stock_consumption(
+    stock_id: UUID,
+    consumption_id: UUID,
+    body: VoidRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    st = await db.get(MaterialStock, stock_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="stock not found")
+
+    c = await db.get(ConsumptionRecord, consumption_id)
+    if not c or c.stock_id != stock_id:
+        raise HTTPException(status_code=404, detail="consumption not found")
+    if getattr(c, "voided_at", None) is not None:
+        raise HTTPException(status_code=409, detail="consumption already voided")
+    if str(c.source or "") not in {"manual", "manual_stock"}:
+        raise HTTPException(status_code=409, detail="only manual consumptions can be voided")
+
+    grams = int(getattr(c, "grams_effective", None) or getattr(c, "grams") or 0)
+    if grams <= 0:
+        raise HTTPException(status_code=409, detail="invalid consumption grams")
+
+    now = datetime.now(timezone.utc)
+    c.voided_at = now
+    c.void_reason = body.reason
+
+    await apply_stock_delta(
+        db,
+        stock_id,
+        +int(grams),
+        reason=f"void consumption={consumption_id} note={body.reason or ''}",
+        job_id=None,
+        kind="reversal",
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/{stock_id}/ledger/{ledger_id}/void")
+async def void_stock_ledger_row(
+    stock_id: UUID,
+    ledger_id: UUID,
+    body: VoidRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    st = await db.get(MaterialStock, stock_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="stock not found")
+
+    r = await db.get(MaterialLedger, ledger_id)
+    if not r or r.stock_id != stock_id:
+        raise HTTPException(status_code=404, detail="ledger row not found")
+    if getattr(r, "voided_at", None) is not None:
+        raise HTTPException(status_code=409, detail="ledger row already voided")
+
+    if r.job_id is not None or (r.kind or "") != "adjustment":
+        raise HTTPException(status_code=409, detail="only manual adjustment rows can be voided")
+
+    delta = int(r.delta_grams or 0)
+    if delta == 0:
+        raise HTTPException(status_code=409, detail="invalid ledger delta")
+    # Safe reversal for positive deltas: cannot reverse grams already consumed.
+    if delta > 0 and int(st.remaining_grams) < int(delta):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "cannot void: adjustment grams already consumed",
+                "stock_remaining_grams": int(st.remaining_grams),
+                "adjustment_grams": int(delta),
+            },
+        )
+
+    now = datetime.now(timezone.utc)
+    r.voided_at = now
+    r.void_reason = body.reason
+
+    await apply_stock_delta(
+        db,
+        stock_id,
+        -int(delta),
+        reason=f"void ledger={ledger_id} note={body.reason or ''}",
+        job_id=None,
+        kind="reversal",
+        reversal_of_id=ledger_id,
+    )
+    await db.commit()
+    return {"ok": True}
 

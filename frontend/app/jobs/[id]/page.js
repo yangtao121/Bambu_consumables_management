@@ -36,6 +36,10 @@ const manualSchema = z.object({
   note: z.string().trim().optional()
 });
 
+const voidSchema = z.object({
+  reason: z.string().trim().optional()
+});
+
 export default function Page({ params }) {
   const jobId = params?.id;
   const [job, setJob] = useState(null);
@@ -47,10 +51,17 @@ export default function Page({ params }) {
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const [resolveMap, setResolveMap] = useState({});
+  const [voidOpen, setVoidOpen] = useState(false);
+  const [voidTarget, setVoidTarget] = useState(null);
 
   const form = useForm({
     resolver: zodResolver(manualSchema),
     defaultValues: { stock_id: "", grams: 0, note: "" }
+  });
+
+  const voidForm = useForm({
+    resolver: zodResolver(voidSchema),
+    defaultValues: { reason: "" }
   });
 
   function normalizeColorHex(v) {
@@ -115,7 +126,10 @@ export default function Page({ params }) {
     reload();
   }, [jobId]);
 
-  const totalGrams = useMemo(() => cons.reduce((acc, r) => acc + Number(r.grams || 0), 0), [cons]);
+  const totalGrams = useMemo(
+    () => cons.filter((r) => !r?.voided_at).reduce((acc, r) => acc + Number(r.grams || 0), 0),
+    [cons]
+  );
 
   async function addManual(values) {
     await fetchJson(`/jobs/${jobId}/consumptions`, {
@@ -129,6 +143,15 @@ export default function Page({ params }) {
     toast.success("已补录扣料");
     setOpen(false);
     form.reset({ stock_id: "", grams: 0, note: "" });
+    await reload();
+  }
+
+  async function voidManual(consumptionId, reason) {
+    await fetchJson(`/jobs/${jobId}/consumptions/${consumptionId}/void`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ? reason : null })
+    });
+    toast.success("已撤销手工扣料");
     await reload();
   }
 
@@ -328,6 +351,7 @@ export default function Page({ params }) {
                   <th className="px-3 py-2">克数</th>
                   <th className="px-3 py-2">来源</th>
                   <th className="px-3 py-2">置信度</th>
+                  <th className="px-3 py-2">状态/操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -360,11 +384,35 @@ export default function Page({ params }) {
                     <td className="px-3 py-2 font-medium">{c.grams}</td>
                     <td className="px-3 py-2">{c.source}</td>
                     <td className="px-3 py-2">{c.confidence}</td>
+                    <td className="px-3 py-2">
+                      {c.voided_at ? (
+                        <div>
+                          <div className="text-xs text-destructive">已作废</div>
+                          <div className="text-xs text-muted-foreground">
+                            {fmtTime(c.voided_at)}{c.void_reason ? ` · ${c.void_reason}` : ""}
+                          </div>
+                        </div>
+                      ) : c.source === "manual" ? (
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => {
+                            setVoidTarget(c);
+                            voidForm.reset({ reason: "" });
+                            setVoidOpen(true);
+                          }}
+                        >
+                          撤销
+                        </Button>
+                      ) : (
+                        "-"
+                      )}
+                    </td>
                   </tr>
                 ))}
                 {cons.length === 0 ? (
                   <tr>
-                    <td className="px-3 py-8 text-center text-muted-foreground" colSpan={5}>
+                    <td className="px-3 py-8 text-center text-muted-foreground" colSpan={6}>
                       暂无扣料记录
                     </td>
                   </tr>
@@ -419,6 +467,47 @@ export default function Page({ params }) {
               </Button>
               <Button type="submit" disabled={form.formState.isSubmitting}>
                 {form.formState.isSubmitting ? "提交中…" : "提交"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={voidOpen}
+        onOpenChange={(v) => {
+          setVoidOpen(v);
+          if (!v) setVoidTarget(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>撤销手工扣料</DialogTitle>
+            <DialogDescription>撤销会保留审计记录，并把库存克数回滚回来。</DialogDescription>
+          </DialogHeader>
+          <form
+            className="grid gap-4"
+            onSubmit={voidForm.handleSubmit(async (v) => {
+              try {
+                if (!voidTarget?.id) return;
+                await voidManual(voidTarget.id, v.reason);
+                setVoidOpen(false);
+                setVoidTarget(null);
+              } catch (e) {
+                toast.error(String(e?.message || e));
+              }
+            })}
+          >
+            <div className="grid gap-2">
+              <Label>原因（可选）</Label>
+              <Input {...voidForm.register("reason")} placeholder="例如：误操作/重复补录" />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setVoidOpen(false)}>
+                取消
+              </Button>
+              <Button type="submit" variant="destructive" disabled={voidForm.formState.isSubmitting}>
+                {voidForm.formState.isSubmitting ? "处理中…" : "确认撤销"}
               </Button>
             </DialogFooter>
           </form>

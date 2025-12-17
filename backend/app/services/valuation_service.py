@@ -72,7 +72,7 @@ async def compute_stock_valuations(
     consumption_rows = (
         await db.execute(
             select(ConsumptionRecord)
-            .where(ConsumptionRecord.stock_id.in_(stock_ids))
+            .where(ConsumptionRecord.stock_id.in_(stock_ids), ConsumptionRecord.voided_at.is_(None))
             .order_by(ConsumptionRecord.created_at.asc(), ConsumptionRecord.id.asc())
         )
     ).scalars().all()

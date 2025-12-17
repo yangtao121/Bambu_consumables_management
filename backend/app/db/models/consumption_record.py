@@ -14,7 +14,10 @@ class ConsumptionRecord(Base):
     __tablename__ = "consumption_records"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("print_jobs.id", ondelete="CASCADE"), nullable=False)
+    # job_id is nullable to support manual stock consumptions not tied to a job
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("print_jobs.id", ondelete="CASCADE"), nullable=True
+    )
     # legacy (spool-mode)
     spool_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("spools.id", ondelete="RESTRICT"), nullable=True)
     # new (stock-mode)
@@ -32,6 +35,8 @@ class ConsumptionRecord(Base):
     source: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    void_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 Index("ix_consumption_records_job_id", ConsumptionRecord.job_id)
