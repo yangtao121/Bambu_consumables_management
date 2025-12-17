@@ -255,6 +255,6 @@ async def daily_report(
         "from_date": start_date.isoformat(),
         "to_date": today.isoformat(),
         "daily": daily,
-    }
+        }
 
 
