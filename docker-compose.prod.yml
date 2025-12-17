@@ -19,7 +19,7 @@ services:
       retries: 30
 
   api:
-    image: 192.168.5.54:5000/bambu-consumables/api-arm:${IMAGE_TAG:-latest}
+    image: 192.168.5.54:5000/bambu-consumables/api-x86:${IMAGE_TAG:-latest}
     environment:
       APP_ENV: ${APP_ENV:-prod}
       APP_SECRET_KEY: ${APP_SECRET_KEY:-change-me}
@@ -47,7 +47,7 @@ services:
       retries: 30
 
   collector:
-    image: 192.168.5.54:5000/bambu-consumables/collector-arm:${IMAGE_TAG:-latest}
+    image: 192.168.5.54:5000/bambu-consumables/collector-x86:${IMAGE_TAG:-latest}
     environment:
       APP_ENV: ${APP_ENV:-prod}
       APP_SECRET_KEY: ${APP_SECRET_KEY:-change-me}
@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: 192.168.5.54:5000/bambu-consumables/frontend-arm:${IMAGE_TAG:-latest}
+    image: 192.168.5.54:5000/bambu-consumables/frontend-x86:${IMAGE_TAG:-latest}
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:${API_PORT:-8000}}
     depends_on:
