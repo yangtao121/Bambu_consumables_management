@@ -24,6 +24,7 @@ from app.schemas.stock import (
     StockUpdate,
 )
 from app.services.stock_service import apply_stock_delta
+from app.services.tray_service import get_total_trays
 
 
 router = APIRouter(prefix="/stocks", tags=["stocks"])
@@ -251,6 +252,16 @@ async def update_stock_ledger_row(
     if not await db.get(MaterialStock, stock_id):
         raise HTTPException(status_code=404, detail="stock not found")
 
+    total_trays = await get_total_trays(db)
+    if total_trays < 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "total trays is negative; tray mutations are temporarily blocked until fixed",
+                "total_trays": int(total_trays),
+            },
+        )
+
     r = await db.get(MaterialLedger, ledger_id)
     if not r:
         raise HTTPException(status_code=404, detail="ledger row not found")
@@ -262,15 +273,35 @@ async def update_stock_ledger_row(
         raise HTTPException(status_code=409, detail="only purchase ledger rows can be edited")
 
     patch = body.model_dump(exclude_unset=True)
+
+    # Predict tray_delta change (global trays cannot go negative)
+    old_tray_delta = int(r.tray_delta or 0)
+    prospective_has_tray = patch.get("has_tray", r.has_tray)
+    prospective_rolls_count = patch.get("rolls_count", r.rolls_count)
+    has_tray_true = bool(prospective_has_tray) if prospective_has_tray is not None else False
+    rolls_count = int(prospective_rolls_count or 0)
+    new_tray_delta = int(rolls_count) if has_tray_true else 0
+    tray_change = int(new_tray_delta) - int(old_tray_delta)
+    if int(total_trays) + int(tray_change) < 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "total trays cannot be negative",
+                "total_trays": int(total_trays),
+                "old_tray_delta": int(old_tray_delta),
+                "new_tray_delta": int(new_tray_delta),
+                "tray_change": int(tray_change),
+                "new_total": int(int(total_trays) + int(tray_change)),
+            },
+        )
+
     if "note" in patch:
         r.reason = patch.pop("note")
     for k, v in patch.items():
         setattr(r, k, v)
 
-    # Recompute tray_delta based on has_tray + rolls_count
-    has_tray = bool(r.has_tray) if r.has_tray is not None else False
-    rolls_count = int(r.rolls_count or 0)
-    r.tray_delta = int(rolls_count) if has_tray else 0
+    # Apply predicted tray_delta based on has_tray + rolls_count
+    r.tray_delta = int(new_tray_delta)
     r.kind = r.kind or "purchase"
 
     await db.commit()
