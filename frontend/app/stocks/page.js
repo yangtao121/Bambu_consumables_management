@@ -37,14 +37,36 @@ const createSchema = z.object({
     })
     .refine((v) => v === null || v >= 0, "卷单价必须 >= 0")
     .optional(),
+  price_total: z
+    .union([z.string(), z.number(), z.null(), z.undefined()])
+    .transform((v) => {
+      if (v === "" || v === null || typeof v === "undefined") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    })
+    .refine((v) => v === null || v >= 0, "总价必须 >= 0")
+    .optional(),
   has_tray: z.boolean().optional()
 });
+
+function round2(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return null;
+  return Math.round(v * 100) / 100;
+}
+
+function fmtMoney(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "-";
+  return (Math.round(v * 100) / 100).toFixed(2);
+}
 
 export default function Page() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
   const [includeArchived, setIncludeArchived] = useState(false);
   const [trayTotal, setTrayTotal] = useState(null);
+  const [valuations, setValuations] = useState(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState(null);
@@ -54,6 +76,7 @@ export default function Page() {
   const [colorQuery, setColorQuery] = useState("");
   const [sortKey, setSortKey] = useState("remaining"); // remaining | created | updated
   const [sortDir, setSortDir] = useState("desc"); // asc | desc
+  const [lastPriceEdited, setLastPriceEdited] = useState(null); // "per_roll" | "total" | null
 
   const form = useForm({
     resolver: zodResolver(createSchema),
@@ -64,6 +87,7 @@ export default function Page() {
       roll_weight_grams: 1000,
       rolls_count: 1,
       price_per_roll: null,
+      price_total: null,
       has_tray: false
     }
   });
@@ -71,6 +95,22 @@ export default function Page() {
   const watchRollWeight = form.watch("roll_weight_grams");
   const watchRollsCount = form.watch("rolls_count");
   const watchPricePerRoll = form.watch("price_per_roll");
+  const watchPriceTotal = form.watch("price_total");
+
+  useEffect(() => {
+    const n = Number(watchRollsCount || 0);
+    if (!Number.isFinite(n) || n <= 0) return;
+    const ppr = watchPricePerRoll === null || typeof watchPricePerRoll === "undefined" ? null : Number(watchPricePerRoll);
+    const pt = watchPriceTotal === null || typeof watchPriceTotal === "undefined" ? null : Number(watchPriceTotal);
+    if (lastPriceEdited === "per_roll" && Number.isFinite(ppr)) {
+      const next = round2(ppr * n);
+      if (next !== null) form.setValue("price_total", next, { shouldDirty: true, shouldValidate: true });
+    } else if (lastPriceEdited === "total" && Number.isFinite(pt)) {
+      const next = round2(pt / n);
+      if (next !== null) form.setValue("price_per_roll", next, { shouldDirty: true, shouldValidate: true });
+    }
+  }, [watchRollsCount, watchPricePerRoll, watchPriceTotal, lastPriceEdited]);
+
   const previewAddGrams = useMemo(() => {
     const w = Number(watchRollWeight || 0);
     const n = Number(watchRollsCount || 0);
@@ -80,21 +120,25 @@ export default function Page() {
   const previewTotalPrice = useMemo(() => {
     const n = Number(watchRollsCount || 0);
     const p = watchPricePerRoll === null || typeof watchPricePerRoll === "undefined" ? null : Number(watchPricePerRoll);
+    const t = watchPriceTotal === null || typeof watchPriceTotal === "undefined" ? null : Number(watchPriceTotal);
     if (!Number.isFinite(n) || n <= 0) return null;
+    if (Number.isFinite(t) && t >= 0) return round2(t);
     if (!Number.isFinite(p) || p < 0) return null;
-    return Math.round(p * n * 100) / 100;
-  }, [watchRollsCount, watchPricePerRoll]);
+    return round2(p * n);
+  }, [watchRollsCount, watchPricePerRoll, watchPriceTotal]);
 
   async function reload(opts = {}) {
     const inc = typeof opts.includeArchived === "boolean" ? opts.includeArchived : includeArchived;
     setLoading(true);
     try {
-      const [data, tray] = await Promise.all([
+      const [data, tray, vals] = await Promise.all([
         fetchJson(`/stocks${inc ? "?include_archived=1" : ""}`),
-        fetchJson("/trays/summary").catch(() => null)
+        fetchJson("/trays/summary").catch(() => null),
+        fetchJson(`/stocks/valuations${inc ? "?include_archived=1" : ""}`).catch(() => null)
       ]);
       setItems(Array.isArray(data) ? data : []);
       setTrayTotal(tray && typeof tray.total_trays === "number" ? tray.total_trays : null);
+      setValuations(vals && typeof vals === "object" ? vals : null);
     } finally {
       setLoading(false);
     }
@@ -158,6 +202,27 @@ export default function Page() {
     () => activeItems.reduce((acc, s) => acc + Number(s.remaining_grams || 0), 0),
     [activeItems]
   );
+  const valuationTotals = useMemo(() => {
+    const t = valuations && typeof valuations === "object" ? valuations.totals : null;
+    if (!t || typeof t !== "object") {
+      return {
+        purchased_value_total: null,
+        consumed_value_est: null,
+        remaining_value_est: null,
+        consumed_rolls_est: null
+      };
+    }
+    return {
+      purchased_value_total: typeof t.purchased_value_total === "number" ? t.purchased_value_total : null,
+      consumed_value_est: typeof t.consumed_value_est === "number" ? t.consumed_value_est : null,
+      remaining_value_est: typeof t.remaining_value_est === "number" ? t.remaining_value_est : null,
+      consumed_rolls_est: typeof t.consumed_rolls_est === "number" ? t.consumed_rolls_est : null
+    };
+  }, [valuations]);
+  const valuationById = useMemo(() => {
+    const m = valuations && typeof valuations === "object" ? valuations.by_stock_id : null;
+    return m && typeof m === "object" ? m : {};
+  }, [valuations]);
 
   async function onSubmit(values) {
     const res = await fetchJson("/stocks", {
@@ -170,6 +235,7 @@ export default function Page() {
         rolls_count: Number(values.rolls_count),
         price_per_roll:
           values.price_per_roll === null || typeof values.price_per_roll === "undefined" ? null : Number(values.price_per_roll),
+        price_total: values.price_total === null || typeof values.price_total === "undefined" ? null : Number(values.price_total),
         has_tray: Boolean(values.has_tray)
       })
     });
@@ -312,6 +378,57 @@ export default function Page() {
         </Card>
       </div>
 
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>累计购入总价值</CardTitle>
+            <CardDescription>所有可计价入库流水累计（元）。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuationTotals.purchased_value_total === null ? "-" : fmtMoney(valuationTotals.purchased_value_total)}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>已消耗价值</CardTitle>
+            <CardDescription>按移动加权平均估算（仅计已计价部分）。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuationTotals.consumed_value_est === null ? "-" : fmtMoney(valuationTotals.consumed_value_est)}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>当前剩余价值</CardTitle>
+            <CardDescription>已计价余额的剩余成本估算。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuationTotals.remaining_value_est === null ? "-" : fmtMoney(valuationTotals.remaining_value_est)}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>已消耗卷数</CardTitle>
+            <CardDescription>按消耗克数 / 单卷克数估算。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuationTotals.consumed_rolls_est === null ? "-" : round2(valuationTotals.consumed_rolls_est)}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：卷（估算）</div>
+          </CardContent>
+        </Card>
+      </div>
+
       <Card>
         <CardHeader>
           <CardTitle>库存列表</CardTitle>
@@ -325,12 +442,20 @@ export default function Page() {
                   <th className="px-3 py-2">库存项</th>
                   <th className="px-3 py-2">单卷</th>
                   <th className="px-3 py-2">剩余</th>
+                  <th className="px-3 py-2">价值（购入/消耗/剩余）</th>
+                  <th className="px-3 py-2">已消耗（卷）</th>
                   <th className="px-3 py-2">更新时间</th>
                   <th className="px-3 py-2">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {sortedActiveItems.map((s) => (
+                {sortedActiveItems.map((s) => {
+                  const v = s?.id ? valuationById[String(s.id)] : null;
+                  const pv = v && typeof v.purchased_value_total === "number" ? v.purchased_value_total : null;
+                  const cv = v && typeof v.consumed_value_est === "number" ? v.consumed_value_est : null;
+                  const rv = v && typeof v.remaining_value_est === "number" ? v.remaining_value_est : null;
+                  const cr = v && typeof v.consumed_rolls_est === "number" ? v.consumed_rolls_est : null;
+                  return (
                   <tr key={s.id} className="border-t">
                     <td className="px-3 py-2">
                       <Link className="font-medium hover:underline" href={`/stocks/${s.id}`}>
@@ -339,6 +464,10 @@ export default function Page() {
                     </td>
                     <td className="px-3 py-2">{s.roll_weight_grams}g</td>
                     <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
+                    <td className="px-3 py-2">
+                      {pv === null && cv === null && rv === null ? "-" : `${fmtMoney(pv)} / ${fmtMoney(cv)} / ${fmtMoney(rv)}`}
+                    </td>
+                    <td className="px-3 py-2">{cr === null ? "-" : round2(cr)}</td>
                     <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
                     <td className="px-3 py-2">
                       <Button
@@ -355,16 +484,23 @@ export default function Page() {
                       </Button>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
                 {includeArchived && sortedArchivedItems.length ? (
                   <tr className="border-t bg-muted/30">
-                    <td colSpan={5} className="px-3 py-2 text-xs text-muted-foreground">
+                    <td colSpan={7} className="px-3 py-2 text-xs text-muted-foreground">
                       已归档（不参与颜色搜索过滤）
                     </td>
                   </tr>
                 ) : null}
                 {includeArchived
-                  ? sortedArchivedItems.map((s) => (
+                  ? sortedArchivedItems.map((s) => {
+                      const v = s?.id ? valuationById[String(s.id)] : null;
+                      const pv = v && typeof v.purchased_value_total === "number" ? v.purchased_value_total : null;
+                      const cv = v && typeof v.consumed_value_est === "number" ? v.consumed_value_est : null;
+                      const rv = v && typeof v.remaining_value_est === "number" ? v.remaining_value_est : null;
+                      const cr = v && typeof v.consumed_rolls_est === "number" ? v.consumed_rolls_est : null;
+                      return (
                       <tr key={s.id} className="border-t">
                         <td className="px-3 py-2">
                           <Link className="font-medium hover:underline" href={`/stocks/${s.id}`}>
@@ -376,6 +512,10 @@ export default function Page() {
                         </td>
                         <td className="px-3 py-2">{s.roll_weight_grams}g</td>
                         <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
+                        <td className="px-3 py-2">
+                          {pv === null && cv === null && rv === null ? "-" : `${fmtMoney(pv)} / ${fmtMoney(cv)} / ${fmtMoney(rv)}`}
+                        </td>
+                        <td className="px-3 py-2">{cr === null ? "-" : round2(cr)}</td>
                         <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
                         <td className="px-3 py-2">
                           <Button variant="destructive" size="sm" disabled>
@@ -383,11 +523,12 @@ export default function Page() {
                           </Button>
                         </td>
                       </tr>
-                    ))
+                      );
+                    })
                   : null}
                 {!includeArchived && sortedActiveItems.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-3 py-8 text-center text-muted-foreground">
+                    <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
                       {colorQuery.trim()
                         ? "未找到匹配该颜色的未归档库存项。"
                         : "暂无库存项，请点击右上角“新增库存”。"}
@@ -396,7 +537,7 @@ export default function Page() {
                 ) : null}
                 {includeArchived && sortedActiveItems.length === 0 && sortedArchivedItems.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-3 py-8 text-center text-muted-foreground">
+                    <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
                       {colorQuery.trim()
                         ? "未找到匹配该颜色的未归档库存项。（归档项不会参与搜索过滤）"
                         : "暂无库存项，请点击右上角“新增库存”。"}
@@ -426,11 +567,18 @@ export default function Page() {
                   color: v.color,
                   brand: v.brand,
                   roll_weight_grams: v.roll_weight_grams,
-                  rolls_count: 1
+                  rolls_count: 1,
+                  price_per_roll: null,
+                  price_total: null,
+                  has_tray: false
                 });
                 setCreateOpen(false);
               } catch (e) {
-                toast.error(String(e?.message || e));
+                if (e instanceof ApiError && e.detail && typeof e.detail === "object" && typeof e.detail.message === "string") {
+                  toast.error(e.detail.message);
+                } else {
+                  toast.error(String(e?.message || e));
+                }
               }
             })}
           >
@@ -472,9 +620,30 @@ export default function Page() {
               </div>
               <div className="grid gap-2">
                 <Label>卷单价（元/卷，可选）</Label>
-                <Input type="number" step="0.01" {...form.register("price_per_roll")} placeholder="例如：41" />
+                <Input
+                  type="number"
+                  step="0.01"
+                  {...form.register("price_per_roll", {
+                    onChange: () => setLastPriceEdited("per_roll")
+                  })}
+                  placeholder="例如：41"
+                />
                 {form.formState.errors.price_per_roll ? (
                   <div className="text-xs text-destructive">{form.formState.errors.price_per_roll.message}</div>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <Label>总价（元，可选）</Label>
+                <Input
+                  type="number"
+                  step="0.01"
+                  {...form.register("price_total", {
+                    onChange: () => setLastPriceEdited("total")
+                  })}
+                  placeholder="例如：82"
+                />
+                {form.formState.errors.price_total ? (
+                  <div className="text-xs text-destructive">{form.formState.errors.price_total.message}</div>
                 ) : null}
               </div>
               <div className="grid gap-2">

@@ -23,8 +23,15 @@ from app.schemas.stock import (
     StockOut,
     StockUpdate,
 )
+from app.services.pricing_service import (
+    PricingConflict,
+    derive_missing_price_per_roll,
+    derive_missing_price_total,
+    derive_purchase_prices,
+)
 from app.services.stock_service import apply_stock_delta
 from app.services.tray_service import get_total_trays
+from app.services.valuation_service import compute_stock_valuations
 
 
 router = APIRouter(prefix="/stocks", tags=["stocks"])
@@ -51,6 +58,96 @@ async def list_stocks(
     return (await db.execute(stmt)).scalars().all()
 
 
+@router.get("/valuations")
+async def stock_valuations(
+    include_archived: bool = Query(default=False, description="Include archived (soft-deleted) stocks"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Return valuations for stock list UI.
+
+    - purchased_value_total:累计购入总价值（入库流水中可计价部分）
+    - consumed_value_est:已消耗价值（按移动加权平均估算，仅计入已计价部分）
+    - remaining_value_est:当前剩余价值（已计价余额）
+    - consumed_rolls_est:已消耗卷数（估算，克数/单卷克数）
+    """
+    stmt = select(MaterialStock)
+    if not include_archived:
+        stmt = stmt.where(MaterialStock.is_archived.is_(False))
+    stocks = (await db.execute(stmt)).scalars().all()
+    ids = [s.id for s in stocks]
+    vals = await compute_stock_valuations(db, stock_ids=ids)
+
+    totals = {
+        "purchased_value_total": 0.0,
+        "consumed_value_est": 0.0,
+        "remaining_value_est": 0.0,
+        "consumed_rolls_est": 0.0,
+    }
+    by_stock_id: dict[str, dict] = {}
+    for s in stocks:
+        sid = str(s.id)
+        v = vals.get(sid)
+        if v is None:
+            row = {
+                "stock_id": sid,
+                "purchased_value_total": 0.0,
+                "consumed_value_est": 0.0,
+                "remaining_value_est": 0.0,
+                "consumed_grams_total": 0,
+                "consumed_rolls_est": 0.0,
+            }
+        else:
+            row = {
+                "stock_id": v.stock_id,
+                "purchased_value_total": float(v.purchased_value_total),
+                "consumed_value_est": float(v.consumed_value_est),
+                "remaining_value_est": float(v.remaining_value_est),
+                "consumed_grams_total": int(v.consumed_grams_total),
+                "consumed_rolls_est": float(v.consumed_rolls_est),
+            }
+
+        by_stock_id[sid] = row
+        totals["purchased_value_total"] += float(row["purchased_value_total"])
+        totals["consumed_value_est"] += float(row["consumed_value_est"])
+        totals["remaining_value_est"] += float(row["remaining_value_est"])
+        totals["consumed_rolls_est"] += float(row["consumed_rolls_est"])
+
+    totals = {k: float(round(float(v), 2)) for k, v in totals.items()}
+    return {
+        "include_archived": bool(include_archived),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "totals": totals,
+        "by_stock_id": by_stock_id,
+    }
+
+
+@router.get("/{stock_id}/valuation")
+async def stock_valuation(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    s = await db.get(MaterialStock, stock_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="stock not found")
+    vals = await compute_stock_valuations(db, stock_ids=[stock_id])
+    v = vals.get(str(stock_id))
+    if v is None:
+        return {
+            "stock_id": str(stock_id),
+            "purchased_value_total": 0.0,
+            "consumed_value_est": 0.0,
+            "remaining_value_est": 0.0,
+            "consumed_grams_total": 0,
+            "consumed_rolls_est": 0.0,
+        }
+    return {
+        "stock_id": v.stock_id,
+        "purchased_value_total": float(v.purchased_value_total),
+        "consumed_value_est": float(v.consumed_value_est),
+        "remaining_value_est": float(v.remaining_value_est),
+        "consumed_grams_total": int(v.consumed_grams_total),
+        "consumed_rolls_est": float(v.consumed_rolls_est),
+    }
+
+
 @router.post("", response_model=StockCreateResult)
 async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) -> StockCreateResult:
     """
@@ -66,6 +163,12 @@ async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) ->
     rolls_count = int(body.rolls_count) if body.rolls_count is not None else None
     has_tray = bool(body.has_tray) if body.has_tray is not None else None
     tray_delta = int(rolls_count or 0) if has_tray else 0
+    try:
+        price_per_roll, price_total = derive_purchase_prices(
+            rolls_count=rolls_count, price_per_roll=body.price_per_roll, price_total=body.price_total
+        )
+    except PricingConflict as e:
+        raise HTTPException(status_code=409, detail={**e.detail, "message": e.message})
 
     tbl = MaterialStock.__table__
     ins = insert(tbl).values(
@@ -109,8 +212,8 @@ async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) ->
                     reason="create+merge add via api" if merged else "create via api",
                     kind="purchase",
                     rolls_count=rolls_count,
-                    price_per_roll=body.price_per_roll,
-                    price_total=body.price_total,
+                    price_per_roll=price_per_roll,
+                    price_total=price_total,
                     has_tray=has_tray,
                     tray_delta=tray_delta,
                     created_at=now,
@@ -224,6 +327,13 @@ async def stock_ledger(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> li
     ).scalars().all()
     out: list[StockLedgerRow] = []
     for r in rows:
+        # Backward compatible display: if only one side exists, derive the other in response (do not write back).
+        derived_total = derive_missing_price_total(
+            rolls_count=r.rolls_count, price_per_roll=r.price_per_roll, price_total=r.price_total
+        )
+        derived_ppr = derive_missing_price_per_roll(
+            rolls_count=r.rolls_count, price_per_roll=r.price_per_roll, price_total=r.price_total
+        )
         out.append(
             StockLedgerRow(
                 id=r.id,
@@ -232,8 +342,8 @@ async def stock_ledger(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> li
                 job_id=r.job_id,
                 note=r.reason,
                 rolls_count=r.rolls_count,
-                price_per_roll=r.price_per_roll,
-                price_total=r.price_total,
+                price_per_roll=derived_ppr,
+                price_total=derived_total,
                 has_tray=r.has_tray,
                 tray_delta=r.tray_delta,
                 kind=r.kind,
@@ -304,6 +414,16 @@ async def update_stock_ledger_row(
     r.tray_delta = int(new_tray_delta)
     r.kind = r.kind or "purchase"
 
+    # Pricing: derive missing fields + enforce consistency.
+    try:
+        price_per_roll, price_total = derive_purchase_prices(
+            rolls_count=r.rolls_count, price_per_roll=r.price_per_roll, price_total=r.price_total
+        )
+        r.price_per_roll = price_per_roll
+        r.price_total = price_total
+    except PricingConflict as e:
+        raise HTTPException(status_code=409, detail={**e.detail, "message": e.message})
+
     await db.commit()
     await db.refresh(r)
     return StockLedgerRow(
@@ -313,8 +433,12 @@ async def update_stock_ledger_row(
         job_id=r.job_id,
         note=r.reason,
         rolls_count=r.rolls_count,
-        price_per_roll=r.price_per_roll,
-        price_total=r.price_total,
+        price_per_roll=derive_missing_price_per_roll(
+            rolls_count=r.rolls_count, price_per_roll=r.price_per_roll, price_total=r.price_total
+        ),
+        price_total=derive_missing_price_total(
+            rolls_count=r.rolls_count, price_per_roll=r.price_per_roll, price_total=r.price_total
+        ),
         has_tray=r.has_tray,
         tray_delta=r.tray_delta,
         kind=r.kind,

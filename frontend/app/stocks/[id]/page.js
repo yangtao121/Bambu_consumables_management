@@ -7,7 +7,7 @@ import { z } from "zod";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 
-import { fetchJson } from "../../../lib/api";
+import { ApiError, fetchJson } from "../../../lib/api";
 import { Button } from "../../../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../../../components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "../../../components/ui/dialog";
@@ -50,14 +50,28 @@ const editPurchaseSchema = z.object({
   note: z.string().trim().optional()
 });
 
+function round2(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return null;
+  return Math.round(v * 100) / 100;
+}
+
+function fmtMoney(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "-";
+  return (Math.round(v * 100) / 100).toFixed(2);
+}
+
 export default function Page({ params }) {
   const stockId = params?.id;
   const [stock, setStock] = useState(null);
   const [ledger, setLedger] = useState([]);
+  const [valuation, setValuation] = useState(null);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [editRow, setEditRow] = useState(null);
+  const [lastPriceEdited, setLastPriceEdited] = useState(null); // "per_roll" | "total" | null
 
   const form = useForm({
     resolver: zodResolver(adjustmentSchema),
@@ -69,13 +83,35 @@ export default function Page({ params }) {
     defaultValues: { rolls_count: 0, price_per_roll: null, price_total: null, has_tray: false, note: "" }
   });
 
+  const watchEditRolls = editForm.watch("rolls_count");
+  const watchEditPpr = editForm.watch("price_per_roll");
+  const watchEditTotal = editForm.watch("price_total");
+  useEffect(() => {
+    const n = Number(watchEditRolls || 0);
+    if (!Number.isFinite(n) || n <= 0) return;
+    const ppr = watchEditPpr === null || typeof watchEditPpr === "undefined" ? null : Number(watchEditPpr);
+    const pt = watchEditTotal === null || typeof watchEditTotal === "undefined" ? null : Number(watchEditTotal);
+    if (lastPriceEdited === "per_roll" && Number.isFinite(ppr)) {
+      const next = round2(ppr * n);
+      if (next !== null) editForm.setValue("price_total", next, { shouldDirty: true, shouldValidate: true });
+    } else if (lastPriceEdited === "total" && Number.isFinite(pt)) {
+      const next = round2(pt / n);
+      if (next !== null) editForm.setValue("price_per_roll", next, { shouldDirty: true, shouldValidate: true });
+    }
+  }, [watchEditRolls, watchEditPpr, watchEditTotal, lastPriceEdited]);
+
   async function reload() {
     if (!stockId) return;
     setLoading(true);
     try {
-      const [s, l] = await Promise.all([fetchJson(`/stocks/${stockId}`), fetchJson(`/stocks/${stockId}/ledger`)]);
+      const [s, l, v] = await Promise.all([
+        fetchJson(`/stocks/${stockId}`),
+        fetchJson(`/stocks/${stockId}/ledger`),
+        fetchJson(`/stocks/${stockId}/valuation`).catch(() => null)
+      ]);
       setStock(s);
       setLedger(Array.isArray(l) ? l : []);
+      setValuation(v && typeof v === "object" ? v : null);
     } finally {
       setLoading(false);
     }
@@ -173,6 +209,57 @@ export default function Page({ params }) {
         </Card>
       </div>
 
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>累计购入总价值</CardTitle>
+            <CardDescription>该库存项可计价入库累计（元）。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuation && typeof valuation.purchased_value_total === "number" ? fmtMoney(valuation.purchased_value_total) : "-"}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>已消耗价值</CardTitle>
+            <CardDescription>按移动加权平均估算（仅计已计价部分）。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuation && typeof valuation.consumed_value_est === "number" ? fmtMoney(valuation.consumed_value_est) : "-"}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>当前剩余价值</CardTitle>
+            <CardDescription>已计价余额的剩余成本估算。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuation && typeof valuation.remaining_value_est === "number" ? fmtMoney(valuation.remaining_value_est) : "-"}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>已消耗卷数</CardTitle>
+            <CardDescription>按消耗克数 / 单卷克数估算。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {valuation && typeof valuation.consumed_rolls_est === "number" ? round2(valuation.consumed_rolls_est) : "-"}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">单位：卷（估算）</div>
+          </CardContent>
+        </Card>
+      </div>
+
       <Card>
         <CardHeader>
           <CardTitle>流水</CardTitle>
@@ -223,6 +310,7 @@ export default function Page({ params }) {
                               has_tray: Boolean(r.has_tray),
                               note: r.note || ""
                             });
+                            setLastPriceEdited(null);
                             setEditOpen(true);
                           }}
                         >
@@ -257,7 +345,11 @@ export default function Page({ params }) {
               try {
                 await submitAdjustment(v);
               } catch (e) {
-                toast.error(String(e?.message || e));
+                if (e instanceof ApiError && e.detail && typeof e.detail === "object" && typeof e.detail.message === "string") {
+                  toast.error(e.detail.message);
+                } else {
+                  toast.error(String(e?.message || e));
+                }
               }
             })}
           >
@@ -300,7 +392,11 @@ export default function Page({ params }) {
               try {
                 await submitEditPurchase(v);
               } catch (e) {
-                toast.error(String(e?.message || e));
+                if (e instanceof ApiError && e.detail && typeof e.detail === "object" && typeof e.detail.message === "string") {
+                  toast.error(e.detail.message);
+                } else {
+                  toast.error(String(e?.message || e));
+                }
               }
             })}
           >
@@ -314,14 +410,26 @@ export default function Page({ params }) {
               </div>
               <div className="grid gap-2">
                 <Label>卷单价（元/卷，可留空）</Label>
-                <Input type="number" step="0.01" {...editForm.register("price_per_roll")} />
+                <Input
+                  type="number"
+                  step="0.01"
+                  {...editForm.register("price_per_roll", {
+                    onChange: () => setLastPriceEdited("per_roll")
+                  })}
+                />
                 {editForm.formState.errors.price_per_roll ? (
                   <div className="text-xs text-destructive">{editForm.formState.errors.price_per_roll.message}</div>
                 ) : null}
               </div>
               <div className="grid gap-2">
                 <Label>总价（元，可留空）</Label>
-                <Input type="number" step="0.01" {...editForm.register("price_total")} />
+                <Input
+                  type="number"
+                  step="0.01"
+                  {...editForm.register("price_total", {
+                    onChange: () => setLastPriceEdited("total")
+                  })}
+                />
                 {editForm.formState.errors.price_total ? (
                   <div className="text-xs text-destructive">{editForm.formState.errors.price_total.message}</div>
                 ) : null}
