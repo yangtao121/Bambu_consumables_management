@@ -48,6 +48,15 @@ export default function Page() {
     defaultValues: { material: "PLA", color: "白色", brand: "拓竹", roll_weight_grams: 1000, rolls_count: 1 }
   });
 
+  const watchRollWeight = form.watch("roll_weight_grams");
+  const watchRollsCount = form.watch("rolls_count");
+  const previewAddGrams = useMemo(() => {
+    const w = Number(watchRollWeight || 0);
+    const n = Number(watchRollsCount || 0);
+    if (!Number.isFinite(w) || !Number.isFinite(n)) return 0;
+    return Math.max(0, Math.floor(w) * Math.floor(n));
+  }, [watchRollWeight, watchRollsCount]);
+
   async function reload(opts = {}) {
     const inc = typeof opts.includeArchived === "boolean" ? opts.includeArchived : includeArchived;
     setLoading(true);
@@ -119,7 +128,7 @@ export default function Page() {
   );
 
   async function onSubmit(values) {
-    await fetchJson("/stocks", {
+    const res = await fetchJson("/stocks", {
       method: "POST",
       body: JSON.stringify({
         material: values.material,
@@ -129,8 +138,21 @@ export default function Page() {
         rolls_count: Number(values.rolls_count)
       })
     });
-    toast.success("库存已新增");
+    const stock = res?.stock ?? res;
+    const merged = Boolean(res?.merged);
+    const deltaFallback = Math.max(
+      0,
+      Math.floor(Number(values.roll_weight_grams || 0)) * Math.floor(Number(values.rolls_count || 0))
+    );
+    const delta = Number(res?.delta_grams ?? deltaFallback);
+    const after = Number(res?.remaining_grams_after ?? stock?.remaining_grams ?? 0);
+    if (merged) {
+      toast.success(`已合并到现有库存，累加 ${delta}g（当前 ${after}g）`);
+    } else {
+      toast.success(`库存已新增（当前 ${after}g）`);
+    }
     await reload();
+    return res;
   }
 
   async function doArchive(force) {
@@ -398,6 +420,13 @@ export default function Page() {
                 {form.formState.errors.rolls_count ? (
                   <div className="text-xs text-destructive">{form.formState.errors.rolls_count.message}</div>
                 ) : null}
+              </div>
+            </div>
+
+            <div className="rounded-md border p-3 text-sm">
+              <div className="font-medium">本次将新增</div>
+              <div className="mt-1 text-muted-foreground">
+                约 <span className="font-medium text-foreground">{previewAddGrams}</span> g（卷数 × 单卷克数）。如遇同材质/颜色/品牌已存在，将自动合并累加。
               </div>
             </div>
 

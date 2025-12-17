@@ -90,12 +90,20 @@ async def add_manual_consumption(job_id: UUID, body: ManualConsumptionCreate, db
     if not st:
         raise HTTPException(status_code=404, detail="stock not found")
 
+    grams_requested = int(body.grams)
+    grams_effective = min(int(grams_requested), int(st.remaining_grams))
+    if grams_effective <= 0:
+        raise HTTPException(status_code=409, detail="stock has no remaining grams")
+
     c = ConsumptionRecord(
         job_id=job_id,
         spool_id=None,
         stock_id=body.stock_id,
         tray_id=None,
-        grams=body.grams,
+        segment_idx=None,
+        grams=int(grams_effective),
+        grams_requested=int(grams_requested),
+        grams_effective=int(grams_effective),
         source="manual",
         confidence="high",
         created_at=datetime.now(timezone.utc),
@@ -105,7 +113,7 @@ async def add_manual_consumption(job_id: UUID, body: ManualConsumptionCreate, db
     await apply_stock_delta(
         db,
         body.stock_id,
-        -int(body.grams),
+        -int(grams_effective),
         reason=f"manual job={job_id} note={body.note or ''}",
         job_id=job_id,
     )
@@ -143,6 +151,10 @@ async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: Asyn
         except Exception:
             remaining_pending.append(entry)
             continue
+        try:
+            segment_idx = int(entry.get("segment_idx") or 0)
+        except Exception:
+            segment_idx = 0
 
         stock_id = req_map.get(tray_id_int)
         if not stock_id:
@@ -155,40 +167,45 @@ async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: Asyn
             continue
 
         unit = entry.get("unit")
-        grams = 0
+        grams_requested = 0
         if unit == "grams":
             try:
-                grams = int(entry.get("grams") or 0)
+                grams_requested = int(entry.get("grams_requested") or entry.get("grams") or 0)
             except Exception:
-                grams = 0
+                grams_requested = 0
         elif unit == "pct":
             try:
                 pct_delta = float(entry.get("pct_delta") or 0.0)
             except Exception:
                 pct_delta = 0.0
-            grams = int(round((pct_delta / 100.0) * float(st.roll_weight_grams)))
+            grams_requested = int(round((pct_delta / 100.0) * float(st.roll_weight_grams)))
 
-        if grams <= 0:
+        if grams_requested <= 0:
             # nothing to settle; drop it
             resolved_count += 1
             continue
 
-        # Idempotent: same job+tray+stock only once
+        # Segment-idempotent: same job+tray+segment only once (prevents double deduction when mapping changes)
         exists = await db.scalar(
             select(ConsumptionRecord.id).where(
                 ConsumptionRecord.job_id == job_id,
-                ConsumptionRecord.stock_id == stock_id,
                 ConsumptionRecord.tray_id == tray_id_int,
+                ConsumptionRecord.segment_idx == segment_idx,
             )
         )
         if exists:
             resolved_count += 1
             continue
 
+        grams_effective = min(int(grams_requested), int(st.remaining_grams))
+        if grams_effective <= 0:
+            resolved_count += 1
+            continue
+
         await apply_stock_delta(
             db,
             stock_id,
-            -int(grams),
+            -int(grams_effective),
             reason=f"resolve job={job_id} tray={tray_id_int} source={entry.get('source')}",
             job_id=job_id,
         )
@@ -198,7 +215,10 @@ async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: Asyn
             spool_id=None,
             stock_id=stock_id,
             tray_id=tray_id_int,
-            grams=int(grams),
+            segment_idx=int(segment_idx),
+            grams=int(grams_effective),
+            grams_requested=int(grams_requested),
+            grams_effective=int(grams_effective),
             source=str(entry.get("source") or "resolved_pending"),
             confidence=str(entry.get("confidence") or "low"),
             created_at=datetime.now(timezone.utc),

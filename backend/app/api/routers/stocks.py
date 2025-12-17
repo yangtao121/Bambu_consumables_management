@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Text, cast, func, select
+from sqlalchemy import Text, cast, func, literal_column, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
@@ -12,7 +14,7 @@ from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.material_ledger import MaterialLedger
 from app.db.models.material_stock import MaterialStock
 from app.db.models.print_job import PrintJob
-from app.schemas.stock import StockAdjustmentCreate, StockCreate, StockLedgerRow, StockOut, StockUpdate
+from app.schemas.stock import StockAdjustmentCreate, StockCreate, StockCreateResult, StockLedgerRow, StockOut, StockUpdate
 from app.services.stock_service import apply_stock_delta
 
 
@@ -40,26 +42,76 @@ async def list_stocks(
     return (await db.execute(stmt)).scalars().all()
 
 
-@router.post("", response_model=StockOut)
-async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) -> MaterialStock:
+@router.post("", response_model=StockCreateResult)
+async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) -> StockCreateResult:
+    """
+    Create a new stock item keyed by (material, color, brand).
+    If an active stock with the same key already exists, *merge* by adding remaining_grams.
+
+    roll_weight_grams is only set on insert and is NOT updated on merge.
+    """
     now = datetime.now(timezone.utc)
-    s = MaterialStock(
+    delta_grams = int(body.remaining_grams or 0)
+
+    tbl = MaterialStock.__table__
+    ins = insert(tbl).values(
+        id=uuid.uuid4(),
         material=body.material,
         color=body.color,
         brand=body.brand,
         roll_weight_grams=int(body.roll_weight_grams),
-        remaining_grams=int(body.remaining_grams or 0),
+        remaining_grams=delta_grams,
+        is_archived=False,
+        archived_at=None,
         created_at=now,
         updated_at=now,
     )
-    db.add(s)
+
+    stmt = ins.on_conflict_do_update(
+        index_elements=[tbl.c.material, tbl.c.color, tbl.c.brand],
+        # Must match the partial unique index predicate exactly (see alembic 0004: "is_archived = false")
+        index_where=(tbl.c.is_archived == False),  # noqa: E712
+        set_={
+            "remaining_grams": tbl.c.remaining_grams + ins.excluded.remaining_grams,
+            "updated_at": now,
+        },
+    ).returning(
+        *tbl.c,
+        # PostgreSQL upsert trick: xmax == 0 => inserted, xmax != 0 => updated (merged)
+        literal_column("xmax").label("_xmax"),
+    )
+
     try:
+        row = (await db.execute(stmt)).mappings().one()
+        merged = bool(int(row.get("_xmax") or 0) != 0)
+
+        # Ledger: record the delta added (skip if delta is 0 to reduce noise).
+        if delta_grams != 0:
+            db.add(
+                MaterialLedger(
+                    stock_id=row["id"],
+                    job_id=None,
+                    delta_grams=int(delta_grams),
+                    reason="create+merge add via api" if merged else "create via api",
+                    created_at=now,
+                )
+            )
+
         await db.commit()
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=f"create stock failed: {e}")
-    await db.refresh(s)
-    return s
+
+    # remaining_grams_after reflects the row state after merge/insert
+    after = int(row.get("remaining_grams") or 0)
+    # Build a response with nested stock payload expected by frontend
+    stock = MaterialStock(**{k: v for k, v in row.items() if k in tbl.c.keys()})
+    return StockCreateResult(
+        stock=stock,
+        merged=bool(merged),
+        delta_grams=int(delta_grams),
+        remaining_grams_after=int(after),
+    )
 
 
 @router.get("/{stock_id}", response_model=StockOut)

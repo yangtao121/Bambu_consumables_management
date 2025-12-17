@@ -47,6 +47,13 @@ class StockOut(APIModel):
     updated_at: datetime
 
 
+class StockCreateResult(APIModel):
+    stock: StockOut
+    merged: bool
+    delta_grams: int
+    remaining_grams_after: int
+
+
 class StockAdjustmentCreate(BaseModel):
     delta_grams: int
     reason: str | None = None
