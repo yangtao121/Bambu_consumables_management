@@ -24,7 +24,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./.cursor:/logs
+      - logs_data:/logs
 
   collector:
     build:
@@ -38,7 +38,7 @@ services:
     depends_on:
       - db
     volumes:
-      - ./.cursor:/logs
+      - logs_data:/logs
 
   frontend:
     build:
@@ -52,5 +52,6 @@ services:
 
 volumes:
   db_data:
+  logs_data:
 
 

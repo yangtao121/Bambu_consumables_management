@@ -1,0 +1,92 @@
+# GitLab CI: build & push x86 (amd64) images only.
+# Target registry: 192.168.5.54:5000 (no auth as per current requirement)
+# Images:
+# - 192.168.5.54:5000/bambu-consumables/api-x86:{tag}
+# - 192.168.5.54:5000/bambu-consumables/collector-x86:{tag}
+# - 192.168.5.54:5000/bambu-consumables/frontend-x86:{tag}
+# Tag policy:
+# - Git tag vX.Y.Z: push vX.Y.Z + latest
+# - main branch: push latest + short SHA
+# Note: Runner typically needs privileged=true for docker:dind.
+
+stages:
+  - build
+
+variables:
+  REGISTRY: "192.168.5.54:5000"
+  IMAGE_NAMESPACE: "bambu-consumables"
+
+  # docker-in-docker
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: "overlay2"
+
+  DOCKER_BUILDKIT: "1"
+
+.default_dind:
+  image: docker:27
+  services:
+    - name: docker:27-dind
+  stage: build
+  interruptible: true
+  before_script:
+    - docker info
+
+.build_and_push:
+  extends: .default_dind
+  script:
+    - |
+      set -eu
+
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        TAGS="${CI_COMMIT_TAG} latest"
+      elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
+        TAGS="latest ${CI_COMMIT_SHORT_SHA}"
+      else
+        echo "Skip: not main and not a tag build"
+        exit 0
+      fi
+
+      IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${SERVICE_NAME}-x86"
+
+      echo "Building ${IMAGE} for tags: ${TAGS}"
+
+      # Build once with all tags.
+      BUILD_TAG_ARGS=""
+      for t in ${TAGS}; do
+        BUILD_TAG_ARGS="${BUILD_TAG_ARGS} -t ${IMAGE}:${t}"
+      done
+
+      # Build
+      # shellcheck disable=SC2086
+      docker build ${BUILD_TAG_ARGS} -f "${DOCKERFILE_PATH}" "${BUILD_CONTEXT}"
+
+      # Push
+      for t in ${TAGS}; do
+        docker push "${IMAGE}:${t}"
+      done
+
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+build_api_x86:
+  extends: .build_and_push
+  variables:
+    SERVICE_NAME: "api"
+    DOCKERFILE_PATH: "backend/Dockerfile"
+    BUILD_CONTEXT: "backend"
+
+build_collector_x86:
+  extends: .build_and_push
+  variables:
+    SERVICE_NAME: "collector"
+    DOCKERFILE_PATH: "collector/Dockerfile"
+    BUILD_CONTEXT: "collector"
+
+build_frontend_x86:
+  extends: .build_and_push
+  variables:
+    SERVICE_NAME: "frontend"
+    DOCKERFILE_PATH: "frontend/Dockerfile"
+    BUILD_CONTEXT: "frontend"

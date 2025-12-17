@@ -1,4 +1,11 @@
 export function apiBaseUrl() {
+  // In Next.js, NEXT_PUBLIC_* values are inlined at build time for client code.
+  // To support *runtime* configuration in prebuilt images, we also read a value
+  // injected by `app/layout.js` onto `window.__API_BASE_URL__`.
+  if (typeof window !== "undefined") {
+    const v = window.__API_BASE_URL__;
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+  }
   return process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 }
 
