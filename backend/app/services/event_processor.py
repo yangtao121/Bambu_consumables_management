@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.ams_color_mapping import AmsColorMapping
+from app.db.models.material_ledger import MaterialLedger
 from app.db.models.material_stock import MaterialStock
 from app.db.models.normalized_event import NormalizedEvent
 from app.db.models.print_job import PrintJob
@@ -210,6 +211,99 @@ def _normalize_remain_value(v: object) -> tuple[str, float] | None:
     return ("grams", fv)
 
 
+def _filament_items(data: dict) -> list[dict]:
+    items = data.get("filament")
+    return items if isinstance(items, list) else []
+
+
+def _extract_filament_grams_by_tray(
+    *,
+    data: dict,
+    tray_meta_by_tray: dict,
+    fallback_tray_now: int | None,
+    prefer: str,
+) -> tuple[dict[int, int], str, str]:
+    """
+    Build a best-effort grams-by-tray map from normalized `filament` items.
+
+    prefer:
+      - "used": prefer used_g, fallback to total_g
+      - "total": prefer total_g
+    Returns: (grams_by_tray, source, confidence)
+    """
+    grams_by_tray: dict[int, int] = {}
+    items = _filament_items(data)
+    if not items:
+        return ({}, "none", "low")
+
+    # Normalize tray meta lookup (keys may be str/int)
+    tm: dict[str, dict] = {}
+    if isinstance(tray_meta_by_tray, dict):
+        for k, v in tray_meta_by_tray.items():
+            try:
+                kk = str(int(k))
+            except Exception:
+                continue
+            if isinstance(v, dict):
+                tm[kk] = v
+
+    def _match_tray_id(it: dict) -> int | None:
+        tid = it.get("tray_id")
+        try:
+            if tid is not None:
+                return int(tid)
+        except Exception:
+            pass
+
+        it_type = it.get("type")
+        it_color_hex = it.get("color_hex")
+        if isinstance(it_type, str) and isinstance(it_color_hex, str) and it_color_hex.startswith("#"):
+            candidates: list[int] = []
+            for k, meta in tm.items():
+                if not isinstance(meta, dict):
+                    continue
+                if meta.get("material") != it_type:
+                    continue
+                if meta.get("color_hex") != it_color_hex:
+                    continue
+                try:
+                    candidates.append(int(k))
+                except Exception:
+                    pass
+            if len(candidates) == 1:
+                return candidates[0]
+
+        return fallback_tray_now
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        used_g = it.get("used_g")
+        total_g = it.get("total_g")
+        g = total_g if prefer == "total" else (used_g if used_g is not None else total_g)
+        try:
+            gv = float(g) if g is not None else None
+        except Exception:
+            gv = None
+        if gv is None or not (gv == gv) or gv <= 0:
+            continue
+        grams = int(round(gv))
+        if grams <= 0:
+            continue
+        tray_id = _match_tray_id(it)
+        if tray_id is None:
+            continue
+        grams_by_tray[int(tray_id)] = grams_by_tray.get(int(tray_id), 0) + grams
+
+    if not grams_by_tray:
+        return ({}, "none", "low")
+
+    has_explicit = any(isinstance(it, dict) and it.get("tray_id") is not None for it in items)
+    confidence = "high" if has_explicit else ("medium" if fallback_tray_now is not None else "low")
+    source = "mqtt_filament_total_g" if prefer == "total" else "mqtt_filament_used_g"
+    return (grams_by_tray, source, confidence)
+
+
 async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
     printer_id = ev.printer_id
     job_key = _make_job_key(printer_id, ev)
@@ -277,9 +371,74 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             "tray_meta_by_tray": tray_meta_by_tray,
             "pending_trays": sorted(set(pending_trays)),
             "pending_consumptions": [],
+            # Hard reservation from filament estimate (optional, depends on firmware payload).
+            "reserved_by_tray": {},
+            "reserved_stock_by_tray": {},
+            "reserved_source": None,
+            "reserved_confidence": None,
+            "reserved_at": None,
+            "reservation_release_at": None,
             "settled_at": None,
             "settle_error": None,
         }
+
+        # If PrintStarted event already includes filament estimate totals, reserve immediately.
+        snap = job.spool_binding_snapshot_json or {}
+        tray_meta_for_match = await _hydrate_tray_color_names(
+            session, snap.get("tray_meta_by_tray") if isinstance(snap.get("tray_meta_by_tray"), dict) else {}
+        )
+        grams_by_tray, source, conf = _extract_filament_grams_by_tray(
+            data=data, tray_meta_by_tray=tray_meta_for_match, fallback_tray_now=tray_now, prefer="total"
+        )
+        if grams_by_tray:
+            reserved_by_tray: dict[str, int] = {}
+            reserved_stock_by_tray: dict[str, str] = {}
+            for tid, grams_est in grams_by_tray.items():
+                sid_str = tray_to_stock.get(str(int(tid)))
+                if not sid_str:
+                    continue
+                try:
+                    stock_uuid = uuid.UUID(str(sid_str))
+                except Exception:
+                    continue
+                stock = await session.get(MaterialStock, stock_uuid)
+                if not stock:
+                    continue
+                grams_reserve = min(int(grams_est), int(stock.remaining_grams))
+                if grams_reserve <= 0:
+                    continue
+
+                # Idempotency guard: if reservation ledger already exists for this (job, tray),
+                # do not reserve again even if snapshot is stale.
+                already_reserved = await session.scalar(
+                    select(MaterialLedger.id).where(
+                        MaterialLedger.job_id == job.id,
+                        MaterialLedger.kind == "reservation",
+                        MaterialLedger.reason.like(f"%tray={int(tid)}%"),
+                    )
+                )
+                if already_reserved:
+                    continue
+
+                await apply_stock_delta(
+                    session,
+                    stock_uuid,
+                    -int(grams_reserve),
+                    reason=f"reservation job={job.id} tray={int(tid)} source={source}",
+                    job_id=job.id,
+                    kind="reservation",
+                )
+                reserved_by_tray[str(int(tid))] = int(grams_reserve)
+                reserved_stock_by_tray[str(int(tid))] = str(stock_uuid)
+
+            if reserved_by_tray:
+                snap2 = dict(snap)
+                snap2["reserved_by_tray"] = reserved_by_tray
+                snap2["reserved_stock_by_tray"] = reserved_stock_by_tray
+                snap2["reserved_source"] = source
+                snap2["reserved_confidence"] = conf
+                snap2["reserved_at"] = _utcnow().isoformat()
+                job.spool_binding_snapshot_json = snap2
 
     elif ev.type in {"PrintProgress", "StateChanged"}:
         # Use gcode_state as source-of-truth to avoid "FINISH but running" on cold start.
@@ -332,6 +491,12 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                 "tray_meta_by_tray": tray_meta_by_tray,
                 "pending_trays": sorted(set(pending_trays)),
                 "pending_consumptions": [],
+                "reserved_by_tray": {},
+                "reserved_stock_by_tray": {},
+                "reserved_source": None,
+                "reserved_confidence": None,
+                "reserved_at": None,
+                "reservation_release_at": None,
                 "settled_at": None,
                 "settle_error": None,
             }
@@ -402,6 +567,66 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                 snap2["tray_now"] = tray_now
             job.spool_binding_snapshot_json = snap2
 
+        # Hard reservation (pre-deduct) using filament *estimated total grams* when available.
+        # We do this once per job to avoid churn; final settlement will release + re-deduct.
+        snap = job.spool_binding_snapshot_json or {}
+        if job.status == "running" and isinstance(snap, dict) and not snap.get("reserved_at"):
+            tray_meta_for_match = await _hydrate_tray_color_names(
+                session, snap.get("tray_meta_by_tray") if isinstance(snap.get("tray_meta_by_tray"), dict) else {}
+            )
+            fallback_tray = _normalize_tray_now(snap.get("tray_now"))
+            grams_by_tray, source, conf = _extract_filament_grams_by_tray(
+                data=data, tray_meta_by_tray=tray_meta_for_match, fallback_tray_now=fallback_tray, prefer="total"
+            )
+            if grams_by_tray:
+                tray_to_stock = dict(snap.get("tray_to_stock")) if isinstance(snap.get("tray_to_stock"), dict) else {}
+                reserved_by_tray: dict[str, int] = {}
+                reserved_stock_by_tray: dict[str, str] = {}
+                for tid, grams_est in grams_by_tray.items():
+                    sid_str = tray_to_stock.get(str(int(tid)))
+                    if not sid_str:
+                        continue
+                    try:
+                        stock_uuid = uuid.UUID(str(sid_str))
+                    except Exception:
+                        continue
+                    stock = await session.get(MaterialStock, stock_uuid)
+                    if not stock:
+                        continue
+                    grams_reserve = min(int(grams_est), int(stock.remaining_grams))
+                    if grams_reserve <= 0:
+                        continue
+
+                    already_reserved = await session.scalar(
+                        select(MaterialLedger.id).where(
+                            MaterialLedger.job_id == job.id,
+                            MaterialLedger.kind == "reservation",
+                            MaterialLedger.reason.like(f"%tray={int(tid)}%"),
+                        )
+                    )
+                    if already_reserved:
+                        continue
+
+                    await apply_stock_delta(
+                        session,
+                        stock_uuid,
+                        -int(grams_reserve),
+                        reason=f"reservation job={job.id} tray={int(tid)} source={source}",
+                        job_id=job.id,
+                        kind="reservation",
+                    )
+                    reserved_by_tray[str(int(tid))] = int(grams_reserve)
+                    reserved_stock_by_tray[str(int(tid))] = str(stock_uuid)
+
+                if reserved_by_tray:
+                    snap2 = dict(snap)
+                    snap2["reserved_by_tray"] = reserved_by_tray
+                    snap2["reserved_stock_by_tray"] = reserved_stock_by_tray
+                    snap2["reserved_source"] = source
+                    snap2["reserved_confidence"] = conf
+                    snap2["reserved_at"] = _utcnow().isoformat()
+                    job.spool_binding_snapshot_json = snap2
+
     elif ev.type == "PrintEnded":
         job.status = "ended"
         job.ended_at = ev.occurred_at
@@ -426,6 +651,53 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
         pending_consumptions = list(snap.get("pending_consumptions")) if isinstance(snap.get("pending_consumptions"), list) else []
         tray_meta_by_tray = await _hydrate_tray_color_names(session, tray_meta_by_tray)
 
+        # Release reservation (if any) exactly once, before writing final consumption.
+        reserved_by_tray = dict(snap.get("reserved_by_tray")) if isinstance(snap.get("reserved_by_tray"), dict) else {}
+        reserved_stock_by_tray = (
+            dict(snap.get("reserved_stock_by_tray")) if isinstance(snap.get("reserved_stock_by_tray"), dict) else {}
+        )
+        if reserved_by_tray and not snap.get("reservation_release_at"):
+            for tid_s, grams_res in reserved_by_tray.items():
+                try:
+                    tid = int(tid_s)
+                except Exception:
+                    continue
+                try:
+                    stock_uuid = uuid.UUID(str(reserved_stock_by_tray.get(str(tid), "")))
+                except Exception:
+                    continue
+                try:
+                    grams_i = int(float(grams_res))
+                except Exception:
+                    grams_i = 0
+                if grams_i <= 0:
+                    continue
+
+                # Extra idempotency guard: if a release ledger already exists for this (job, tray),
+                # do not apply again even if snapshot is stale (e.g. crash between ledger+snapshot flush).
+                already_released = await session.scalar(
+                    select(MaterialLedger.id).where(
+                        MaterialLedger.job_id == job.id,
+                        MaterialLedger.kind == "reservation_release",
+                        MaterialLedger.reason.like(f"%tray={int(tid)}%"),
+                    )
+                )
+                if already_released:
+                    continue
+
+                await apply_stock_delta(
+                    session,
+                    stock_uuid,
+                    +int(grams_i),
+                    reason=f"reservation_release job={job.id} tray={int(tid)}",
+                    job_id=job.id,
+                    kind="reservation_release",
+                )
+            snap2 = dict(snap)
+            snap2["reservation_release_at"] = _utcnow().isoformat()
+            job.spool_binding_snapshot_json = snap2
+            snap = snap2
+
         snap_tray_now = _normalize_tray_now(snap.get("tray_now"))
         effective_tray_now = tray_now if tray_now is not None else snap_tray_now
 
@@ -438,10 +710,21 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
         # Always include the last-known tray as a fallback.
         if isinstance(effective_tray_now, int):
             trays_set.add(int(effective_tray_now))
+        # Include any trays mentioned by filament usage/estimate or reservation snapshot.
+        try:
+            for k in reserved_by_tray.keys():
+                trays_set.add(int(k))
+        except Exception:
+            pass
+        filament_trays, _src0, _conf0 = _extract_filament_grams_by_tray(
+            data=data, tray_meta_by_tray=tray_meta_by_tray, fallback_tray_now=effective_tray_now, prefer="used"
+        )
+        for k in filament_trays.keys():
+            trays_set.add(int(k))
         trays_to_settle = sorted(trays_set)
 
-        # If we never captured start snapshot, we cannot reliably settle.
-        if not start_remain_by_tray:
+        # If we never captured start snapshot, we can still settle using filament/estimate/reservation.
+        if not start_remain_by_tray and not (filament_trays or reserved_by_tray):
             snap2 = dict(snap) if isinstance(snap, dict) else {}
             snap2["settled_at"] = _utcnow().isoformat()
             snap2["settle_error"] = "missing_start_remain_by_tray"
@@ -465,8 +748,116 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                     end_remain_by_tray = rb
                     break
 
+        # Prefer filament-derived final grams when available; fallback to reservation snapshot.
+        final_grams_by_tray, final_source, final_confidence = _extract_filament_grams_by_tray(
+            data=data, tray_meta_by_tray=tray_meta_by_tray, fallback_tray_now=effective_tray_now, prefer="used"
+        )
+        if final_source == "none" and reserved_by_tray:
+            final_source = str(snap.get("reserved_source") or "reservation_estimate")
+            final_confidence = str(snap.get("reserved_confidence") or "medium")
+
         for tray_id in trays_to_settle:
             segment_idx = 0
+            # 1) Filament-derived grams (used_g preferred; if only total_g exists in payload, it will be used as fallback)
+            grams_from_filament = final_grams_by_tray.get(int(tray_id))
+            # 2) Reservation fallback (if we reserved earlier, use it as a final estimate when needed)
+            if not grams_from_filament:
+                try:
+                    grams_from_filament = int(float(reserved_by_tray.get(str(int(tray_id))) or 0))
+                except Exception:
+                    grams_from_filament = 0
+
+            if grams_from_filament and grams_from_filament > 0:
+                # Resolve stock id (prefer snapshot mapping).
+                stock_uuid: uuid.UUID | None = None
+                sid_str = tray_to_stock.get(str(int(tray_id)))
+                if sid_str:
+                    try:
+                        stock_uuid = uuid.UUID(str(sid_str))
+                    except Exception:
+                        stock_uuid = None
+                meta = tray_meta_by_tray.get(str(tray_id)) or tray_meta_by_tray.get(tray_id) or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                if stock_uuid is None and meta.get("color"):
+                    stock_uuid = await _resolve_stock_id(
+                        session,
+                        material=meta.get("material"),
+                        color=meta.get("color"),
+                        is_official=bool(meta.get("is_official")),
+                    )
+
+                if stock_uuid is None:
+                    # Pending attribution (dedupe by tray+segment)
+                    already = False
+                    for pc in pending_consumptions:
+                        if isinstance(pc, dict) and int(pc.get("tray_id") or -1) == int(tray_id) and int(pc.get("segment_idx") or -1) == int(segment_idx):
+                            already = True
+                            break
+                    if not already:
+                        pending_consumptions.append(
+                            {
+                                "tray_id": int(tray_id),
+                                "segment_idx": int(segment_idx),
+                                "unit": "grams",
+                                "start": None,
+                                "end": None,
+                                "pct_delta": None,
+                                "grams_requested": int(grams_from_filament),
+                                "source": final_source,
+                                "confidence": final_confidence,
+                                "material": meta.get("material"),
+                                "color": meta.get("color"),
+                                "color_hex": meta.get("color_hex"),
+                                "is_official": bool(meta.get("is_official")),
+                            }
+                        )
+                    continue
+
+                # Idempotency: same job + tray + segment
+                exists = await session.scalar(
+                    select(ConsumptionRecord.id).where(
+                        ConsumptionRecord.job_id == job.id,
+                        ConsumptionRecord.tray_id == int(tray_id),
+                        ConsumptionRecord.segment_idx == int(segment_idx),
+                    )
+                )
+                if exists:
+                    continue
+
+                stock = await session.get(MaterialStock, stock_uuid)
+                if not stock:
+                    continue
+                grams_requested = int(grams_from_filament)
+                grams_effective = min(int(grams_requested), int(stock.remaining_grams))
+                if grams_effective <= 0:
+                    continue
+
+                await apply_stock_delta(
+                    session,
+                    stock_uuid,
+                    -int(grams_effective),
+                    reason=f"consumption job={job.id} tray={int(tray_id)} seg={int(segment_idx)} source={final_source}",
+                    job_id=job.id,
+                    kind="consumption",
+                )
+                c = ConsumptionRecord(
+                    job_id=job.id,
+                    spool_id=None,
+                    stock_id=stock_uuid,
+                    tray_id=int(tray_id),
+                    segment_idx=int(segment_idx),
+                    grams=int(grams_effective),
+                    grams_requested=int(grams_requested),
+                    grams_effective=int(grams_effective),
+                    source=str(final_source),
+                    confidence=str(final_confidence),
+                    created_at=_utcnow(),
+                )
+                session.add(c)
+                await session.flush()
+                continue
+
             s_raw = start_remain_by_tray.get(str(tray_id)) or start_remain_by_tray.get(tray_id)
             e_raw = end_remain_by_tray.get(tray_id)
             s_nv = _normalize_remain_value(s_raw)

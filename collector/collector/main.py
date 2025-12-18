@@ -119,7 +119,15 @@ class PrinterWatcher:
         logger.info("mqtt connected serial=%s reason=%s", self.printer.serial, reason_code)
         client.subscribe(self.topic_report)
 
-    def _on_disconnect(self, client: mqtt.Client, userdata: Any, reason_code: Any, properties: Any = None) -> None:
+    def _on_disconnect(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        disconnect_flags: Any = None,
+        reason_code: Any = None,
+        properties: Any = None,
+    ) -> None:
+        # Callback API v2: (client, userdata, disconnect_flags, reason_code, properties)
         logger.warning("mqtt disconnected serial=%s reason=%s", self.printer.serial, reason_code)
 
     def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
@@ -165,6 +173,122 @@ class PrinterWatcher:
                 time.sleep(5)
 
 
+def _normalize_color_hex(v: object) -> str | None:
+    """
+    Normalize Bambu color field to '#RRGGBB' when possible.
+    Accepts: 'FFFFFF', '#FFFFFF', 'FFFFFFFF' (take last 6), etc.
+    """
+    if not isinstance(v, str):
+        return None
+    s0 = v.strip()
+    if not s0:
+        return None
+    raw = s0[1:].strip() if s0.startswith("#") else s0
+    hx = raw.upper()
+    if not hx:
+        return None
+    if not all(c in "0123456789ABCDEF" for c in hx):
+        return None
+    if len(hx) == 8:
+        return f"#{hx[-6:]}"
+    if len(hx) == 6:
+        return f"#{hx}"
+    return None
+
+
+def _to_int(v: object) -> int | None:
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        vv = v.strip()
+        if vv.isdigit():
+            try:
+                return int(vv)
+            except Exception:
+                return None
+    return None
+
+
+def _to_float(v: object) -> float | None:
+    if isinstance(v, (int, float)):
+        fv = float(v)
+        return fv if fv == fv else None  # NaN guard
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            fv = float(s)
+            return fv if fv == fv else None
+        except Exception:
+            return None
+    return None
+
+
+def _normalize_filament_items(print_obj: dict) -> list[dict]:
+    """
+    Best-effort extraction for slice estimated / runtime filament usage.
+    Field names vary between firmwares; we keep a normalized subset + raw for debugging.
+    """
+    raw_items = print_obj.get("filament")
+    if not isinstance(raw_items, list):
+        return []
+
+    out: list[dict] = []
+    for idx, it in enumerate(raw_items):
+        if not isinstance(it, dict):
+            continue
+
+        tray_id = (
+            _to_int(it.get("tray_id"))
+            or _to_int(it.get("tray"))
+            or _to_int(it.get("trayId"))
+            or _to_int(it.get("ams_tray"))
+        )
+
+        material = it.get("type") or it.get("tray_type") or it.get("material")
+        material_s = material if isinstance(material, str) and material.strip() else None
+        color_hex = _normalize_color_hex(it.get("color") or it.get("tray_color") or it.get("colour"))
+
+        used_len = _to_float(it.get("used") or it.get("used_len") or it.get("used_mm") or it.get("length_used"))
+        total_len = _to_float(it.get("total") or it.get("total_len") or it.get("total_mm") or it.get("length_total"))
+
+        used_g = _to_float(
+            it.get("used_g")
+            or it.get("used_grams")
+            or it.get("grams_used")
+            or it.get("weight_used")
+            or it.get("used_weight")
+        )
+        total_g = _to_float(
+            it.get("total_g")
+            or it.get("total_grams")
+            or it.get("grams_total")
+            or it.get("weight_total")
+            or it.get("total_weight")
+        )
+
+        gcode = it.get("gcode") or it.get("extruder") or it.get("tool")
+        gcode_s = str(gcode).strip() if gcode is not None and str(gcode).strip() else None
+
+        out.append(
+            {
+                "idx": idx,
+                "tray_id": tray_id,
+                "type": material_s,
+                "color_hex": color_hex,
+                "gcode": gcode_s,
+                "used_mm": used_len,
+                "total_mm": total_len,
+                "used_g": used_g,
+                "total_g": total_g,
+                "raw": it,
+            }
+        )
+
+    return out
+
+
 def _normalize_event_from_payload(payload: dict) -> dict | None:
     # 只关心 print 字段（按 docs/局域网读取方法.md 的描述）
     p = payload.get("print")
@@ -177,18 +301,6 @@ def _normalize_event_from_payload(payload: dict) -> dict | None:
         progress_int = int(progress) if progress is not None else None
     except Exception:
         progress_int = None
-
-    def _to_int(v: object) -> int | None:
-        if isinstance(v, int):
-            return v
-        if isinstance(v, str):
-            vv = v.strip()
-            if vv.isdigit():
-                try:
-                    return int(vv)
-                except Exception:
-                    return None
-        return None
 
     ams = p.get("ams") if isinstance(p.get("ams"), dict) else None
     tray_now_raw = ams.get("tray_now") if isinstance(ams, dict) else None
@@ -225,11 +337,14 @@ def _normalize_event_from_payload(payload: dict) -> dict | None:
             }
         )
 
+    filament_items = _normalize_filament_items(p)
+
     return {
         "gcode_state": gcode_state,
         "progress": progress_int,
         "tray_now": tray_now,
         "ams_trays": tray_list,
+        "filament": filament_items,
         "mc_remaining_time": p.get("mc_remaining_time"),
         "gcode_start_time": p.get("gcode_start_time"),
         "gcode_file": p.get("gcode_file"),
@@ -295,6 +410,35 @@ def _ams_signature(normalized_data: dict) -> str:
     }
     # orjson.dumps is stable with OPT_SORT_KEYS; then hash to a short comparable string.
     return _sha256_hex(orjson.dumps(blob, option=orjson.OPT_SORT_KEYS))
+
+
+def _filament_signature(normalized_data: dict) -> str:
+    """
+    Signature for filament usage/estimate fields.
+    Ensures we don't drop usage changes when progress is unchanged.
+    """
+    items = normalized_data.get("filament")
+    if not isinstance(items, list):
+        items = []
+    normalized_items: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        normalized_items.append(
+            {
+                "idx": it.get("idx"),
+                "tray_id": it.get("tray_id"),
+                "type": it.get("type"),
+                "color_hex": it.get("color_hex"),
+                "gcode": it.get("gcode"),
+                "used_mm": it.get("used_mm"),
+                "total_mm": it.get("total_mm"),
+                "used_g": it.get("used_g"),
+                "total_g": it.get("total_g"),
+            }
+        )
+    normalized_items.sort(key=lambda x: (x.get("idx") if isinstance(x.get("idx"), int) else 0))
+    return _sha256_hex(orjson.dumps({"filament": normalized_items}, option=orjson.OPT_SORT_KEYS))
 
 
 def _selftest_ams_dedup() -> None:
@@ -380,10 +524,23 @@ def _selftest_ams_dedup() -> None:
     should_skip_when_same = event_type == "PrintProgress" and n1.get("progress") == last_progress and _ams_signature(n1) == last_sig
     assert should_skip_when_same is True
 
+    # Filament usage changes while progress stays the same => must NOT be treated as identical.
+    p3 = _payload_with_trays(
+        [
+            {"id": "0", "tray_type": "PLA", "tray_color": "FFFFFF", "remain": 90},
+            {"id": "1", "tray_type": "PLA", "tray_color": "FF0000", "remain": 80},
+            {"id": "2", "tray_type": "PLA", "tray_color": "00FF00", "remain": 70},
+        ]
+    )
+    p3["print"]["filament"] = [{"tray_id": "0", "total_g": 12.3, "used_g": 0.1}]
+    n3 = _normalize_event_from_payload(p3)
+    assert isinstance(n3, dict)
+    assert _filament_signature(n3) != _filament_signature(n1)
+
 
 async def ingest_loop(ingest_q: "asyncio.Queue[IngestItem]") -> None:
-    # (last_gcode_state, last_progress, last_ams_sig)
-    state_by_printer: dict[uuid.UUID, tuple[str | None, int | None, str | None]] = {}
+    # (last_gcode_state, last_progress, last_ams_sig, last_fil_sig)
+    state_by_printer: dict[uuid.UUID, tuple[str | None, int | None, str | None, str | None]] = {}
 
     while True:
         item = await ingest_q.get()
@@ -419,17 +576,25 @@ async def ingest_loop(ingest_q: "asyncio.Queue[IngestItem]") -> None:
                 gcode_state = normalized_data.get("gcode_state")
                 progress_int = normalized_data.get("progress")
                 ams_sig = _ams_signature(normalized_data)
+                fil_sig = _filament_signature(normalized_data)
 
-                last_state, last_progress, last_ams_sig = state_by_printer.get(item.printer_id, (None, None, None))
+                last_state, last_progress, last_ams_sig, last_fil_sig = state_by_printer.get(
+                    item.printer_id, (None, None, None, None)
+                )
                 event_type = _derive_event_type(gcode_state, last_state)
 
                 # 降噪：只有在 *进度不变* 且 *AMS 也不变* 时才跳过写入 normalized_events（raw_events 仍保留）。
                 # 这样可以保证“换料/空槽变化（但进度不动）”也会生成新事件，驱动前端更新。
-                if event_type == "PrintProgress" and progress_int == last_progress and ams_sig == last_ams_sig:
+                if (
+                    event_type == "PrintProgress"
+                    and progress_int == last_progress
+                    and ams_sig == last_ams_sig
+                    and fil_sig == last_fil_sig
+                ):
                     await session.commit()
                     continue
 
-                state_by_printer[item.printer_id] = (gcode_state, progress_int, ams_sig)
+                state_by_printer[item.printer_id] = (gcode_state, progress_int, ams_sig, fil_sig)
 
                 ev = {
                     "event_id": _event_id_for_payload(item.printer_id, payload_hash),

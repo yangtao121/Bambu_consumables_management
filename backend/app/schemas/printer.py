@@ -18,6 +18,7 @@ class PrinterCreate(BaseModel):
 
 class PrinterUpdate(BaseModel):
     ip: str | None = None
+    serial: str | None = None
     alias: str | None = None
     model: str | None = None
     lan_access_code: str | None = None

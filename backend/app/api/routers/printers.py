@@ -87,6 +87,8 @@ async def update_printer(printer_id: UUID, body: PrinterUpdate, db: AsyncSession
 
     if body.ip is not None:
         p.ip = body.ip
+    if body.serial is not None:
+        p.serial = body.serial
     if body.alias is not None:
         p.alias = body.alias
     if body.model is not None:
@@ -95,7 +97,11 @@ async def update_printer(printer_id: UUID, body: PrinterUpdate, db: AsyncSession
         p.lan_access_code_enc = encrypt_str(settings.app_secret_key, body.lan_access_code)
 
     p.updated_at = datetime.now(timezone.utc)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="printer serial already exists")
     await db.refresh(p)
     return p
 
