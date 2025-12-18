@@ -87,6 +87,12 @@ def _normalize_color_to_hex_or_name(v: object) -> tuple[str | None, str | None]:
     hx_u = hx.upper()
     is_hex = all(c in "0123456789ABCDEF" for c in hx_u)
     if is_hex and len(hx_u) == 8:
+        # Bambu tray_color is commonly RRGGBBAA (alpha last), e.g. '8E9089FF'.
+        # Some systems use AARRGGBB. Use simple heuristics to support both.
+        if hx_u.endswith(("FF", "00")):
+            return (f"#{hx_u[:6]}", None)
+        if hx_u.startswith(("FF", "00")):
+            return (f"#{hx_u[-6:]}", None)
         return (f"#{hx_u[-6:]}", None)
     if is_hex and len(hx_u) == 6:
         return (f"#{hx_u}", None)
@@ -231,6 +237,11 @@ def _extract_filament_grams_by_tray(
       - "total": prefer total_g
     Returns: (grams_by_tray, source, confidence)
     """
+    # Strict mode: do NOT fallback to tray_now when we cannot uniquely map estimate to a tray.
+    # This is used for gcode-derived estimates where tray_id is unknown and mis-attribution is worse than no reservation.
+    if data.get("filament_strict_no_fallback") is True:
+        fallback_tray_now = None
+
     grams_by_tray: dict[int, int] = {}
     items = _filament_items(data)
     if not items:

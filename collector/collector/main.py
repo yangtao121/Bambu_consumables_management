@@ -6,6 +6,7 @@ import json
 import logging
 import ssl
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from collector.core.config import settings
 from collector.core.crypto import decrypt_str
+from collector.gcode_estimator import GcodeEstimateManager
 from collector.db.models.normalized_event import NormalizedEvent
 from collector.db.models.printer import Printer
 from collector.db.models.raw_event import RawEvent
@@ -27,6 +29,8 @@ from collector.db.session import async_session_factory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("collector")
+
+_GCODE_ESTIMATOR = GcodeEstimateManager()
 
 # region agent log
 import os
@@ -190,6 +194,13 @@ def _normalize_color_hex(v: object) -> str | None:
     if not all(c in "0123456789ABCDEF" for c in hx):
         return None
     if len(hx) == 8:
+        # Bambu tray_color often looks like RRGGBBAA (alpha last), e.g. '8E9089FF'.
+        # Some other sources use AARRGGBB. Use simple heuristics to support both.
+        if hx.endswith(("FF", "00")):
+            return f"#{hx[:6]}"
+        if hx.startswith(("FF", "00")):
+            return f"#{hx[-6:]}"
+        # ambiguous: keep previous behavior
         return f"#{hx[-6:]}"
     if len(hx) == 6:
         return f"#{hx}"
@@ -441,6 +452,63 @@ def _filament_signature(normalized_data: dict) -> str:
     return _sha256_hex(orjson.dumps({"filament": normalized_items}, option=orjson.OPT_SORT_KEYS))
 
 
+def _estimate_signature(normalized_data: dict) -> str:
+    """
+    Signature for gcode-derived estimate fields.
+    We must include this in the dedupe rule; otherwise an estimate that arrives later
+    (while progress stays the same) could be skipped and never persisted.
+    """
+    ge = normalized_data.get("gcode_estimate")
+    if not isinstance(ge, dict):
+        return _sha256_hex(orjson.dumps({"gcode_estimate": None}, option=orjson.OPT_SORT_KEYS))
+
+    # Keep it small + stable.
+    total_g = ge.get("total_g")
+    try:
+        total_g_v = round(float(total_g), 4) if total_g is not None else None
+    except Exception:
+        total_g_v = None
+
+    blob = {
+        "source": ge.get("source"),
+        "confidence": ge.get("confidence"),
+        "gcode_3mf_name": ge.get("gcode_3mf_name"),
+        "member_gcode_path": ge.get("member_gcode_path"),
+        "total_g": total_g_v,
+        "per_filament_len": ge.get("per_filament_len"),
+        "error": ge.get("error"),
+    }
+    return _sha256_hex(orjson.dumps({"gcode_estimate": blob}, option=orjson.OPT_SORT_KEYS))
+
+
+def _make_job_key_from_normalized(printer_id: uuid.UUID, normalized_data: dict, occurred_at: datetime) -> str:
+    task_id = normalized_data.get("task_id") or normalized_data.get("subtask_id")
+    if isinstance(task_id, (int, float)) and task_id:
+        return f"{printer_id}:{int(task_id)}"
+    if isinstance(task_id, str) and task_id.strip() and task_id.strip() != "0":
+        return f"{printer_id}:{task_id.strip()}"
+    gcode_start_time = normalized_data.get("gcode_start_time")
+    gcode_file = normalized_data.get("gcode_file") or ""
+    if isinstance(gcode_start_time, (int, float)) and gcode_start_time > 0:
+        return f"{printer_id}:{int(gcode_start_time)}:{gcode_file}"
+    return f"{printer_id}:{int(occurred_at.timestamp())}:{gcode_file}"
+
+
+def _maybe_inject_cached_gcode_estimate(normalized_data: dict, *, est_key: str) -> None:
+    est = _GCODE_ESTIMATOR.get_cached(est_key)
+    if est is None:
+        return
+
+    normalized_data["gcode_estimate"] = est.as_json()
+
+    # Only override `filament` when MQTT doesn't provide it and we have per-filament totals.
+    existing = normalized_data.get("filament")
+    if (not isinstance(existing, list) or len(existing) == 0) and isinstance(est.per_filament, list) and est.per_filament:
+        normalized_data["filament"] = est.per_filament
+        # Strict mode: backend must NOT fallback to tray_now if tray_id can't be matched uniquely.
+        normalized_data["filament_strict_no_fallback"] = True
+
+
 def _selftest_ams_dedup() -> None:
     """
     Lightweight regression test for the dedupe rule:
@@ -539,8 +607,11 @@ def _selftest_ams_dedup() -> None:
 
 
 async def ingest_loop(ingest_q: "asyncio.Queue[IngestItem]") -> None:
-    # (last_gcode_state, last_progress, last_ams_sig, last_fil_sig)
-    state_by_printer: dict[uuid.UUID, tuple[str | None, int | None, str | None, str | None]] = {}
+    # (last_gcode_state, last_progress, last_ams_sig, last_fil_sig, last_est_sig)
+    state_by_printer: dict[uuid.UUID, tuple[str | None, int | None, str | None, str | None, str | None]] = {}
+    # Small cache to avoid decrypting the LAN code for every message.
+    # printer_id -> (loaded_at_ts, printer_ip, access_code_plain)
+    printer_info_cache: dict[uuid.UUID, tuple[float, str, str]] = {}
 
     while True:
         item = await ingest_q.get()
@@ -575,11 +646,42 @@ async def ingest_loop(ingest_q: "asyncio.Queue[IngestItem]") -> None:
             if normalized_data is not None:
                 gcode_state = normalized_data.get("gcode_state")
                 progress_int = normalized_data.get("progress")
+
+                # G-code estimate: schedule fetch during PREPARE/RUNNING; inject cached result when available.
+                try:
+                    if isinstance(gcode_state, str) and gcode_state in {"PREPARE", "RUNNING"}:
+                        est_key = _make_job_key_from_normalized(item.printer_id, normalized_data, item.received_at)
+                        _maybe_inject_cached_gcode_estimate(normalized_data, est_key=est_key)
+
+                        if _GCODE_ESTIMATOR.get_cached(est_key) is None:
+                            now = time.time()
+                            cached = printer_info_cache.get(item.printer_id)
+                            if not cached or (now - float(cached[0])) > 300.0:
+                                pr = await session.get(Printer, item.printer_id)
+                                if pr and pr.ip and pr.lan_access_code_enc:
+                                    lan_code_plain = decrypt_str(settings.app_secret_key, pr.lan_access_code_enc)
+                                    printer_info_cache[item.printer_id] = (now, str(pr.ip), str(lan_code_plain))
+                                    cached = printer_info_cache[item.printer_id]
+
+                            if cached:
+                                _loaded_at, ip, lan_code_plain = cached
+                                await _GCODE_ESTIMATOR.maybe_schedule(
+                                    key=est_key,
+                                    printer_ip=ip,
+                                    access_code=lan_code_plain,
+                                    subtask_name=normalized_data.get("subtask_name") if isinstance(normalized_data.get("subtask_name"), str) else None,
+                                    gcode_file=normalized_data.get("gcode_file") if isinstance(normalized_data.get("gcode_file"), str) else None,
+                                )
+                except Exception:
+                    # Never break ingestion due to estimator issues.
+                    pass
+
                 ams_sig = _ams_signature(normalized_data)
                 fil_sig = _filament_signature(normalized_data)
+                est_sig = _estimate_signature(normalized_data)
 
-                last_state, last_progress, last_ams_sig, last_fil_sig = state_by_printer.get(
-                    item.printer_id, (None, None, None, None)
+                last_state, last_progress, last_ams_sig, last_fil_sig, last_est_sig = state_by_printer.get(
+                    item.printer_id, (None, None, None, None, None)
                 )
                 event_type = _derive_event_type(gcode_state, last_state)
 
@@ -590,11 +692,12 @@ async def ingest_loop(ingest_q: "asyncio.Queue[IngestItem]") -> None:
                     and progress_int == last_progress
                     and ams_sig == last_ams_sig
                     and fil_sig == last_fil_sig
+                    and est_sig == last_est_sig
                 ):
                     await session.commit()
                     continue
 
-                state_by_printer[item.printer_id] = (gcode_state, progress_int, ams_sig, fil_sig)
+                state_by_printer[item.printer_id] = (gcode_state, progress_int, ams_sig, fil_sig, est_sig)
 
                 ev = {
                     "event_id": _event_id_for_payload(item.printer_id, payload_hash),
