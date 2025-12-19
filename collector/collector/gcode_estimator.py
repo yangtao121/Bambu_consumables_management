@@ -239,7 +239,14 @@ def _extract_per_filament(meta: dict[str, str]) -> list[dict[str, Any]]:
             raw = c0[1:] if c0.startswith("#") else c0
             hx = raw.strip().upper()
             if re.fullmatch(r"[0-9A-F]{8}", hx):
-                color_hex = f"#{hx[-6:]}"
+                # Heuristic: Bambu commonly uses RRGGBBAA (alpha last), e.g. 8E9089FF.
+                # Some slicers use AARRGGBB. Support both.
+                if hx.endswith(("FF", "00")):
+                    color_hex = f"#{hx[:6]}"
+                elif hx.startswith(("FF", "00")):
+                    color_hex = f"#{hx[-6:]}"
+                else:
+                    color_hex = f"#{hx[-6:]}"
             elif re.fullmatch(r"[0-9A-F]{6}", hx):
                 color_hex = f"#{hx}"
 
@@ -290,7 +297,12 @@ def _extract_single_filament_from_meta(meta: dict[str, str], *, total_g: float |
         raw = c0[1:] if c0.startswith("#") else c0
         hx = raw.strip().upper()
         if re.fullmatch(r"[0-9A-F]{8}", hx):
-            color_hex = f"#{hx[-6:]}"
+            if hx.endswith(("FF", "00")):
+                color_hex = f"#{hx[:6]}"
+            elif hx.startswith(("FF", "00")):
+                color_hex = f"#{hx[-6:]}"
+            else:
+                color_hex = f"#{hx[-6:]}"
         elif re.fullmatch(r"[0-9A-F]{6}", hx):
             color_hex = f"#{hx}"
 

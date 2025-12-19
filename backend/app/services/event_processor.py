@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,6 +52,41 @@ def _make_job_key(printer_id: uuid.UUID, ev: NormalizedEvent) -> str:
         return f"{printer_id}:{int(gcode_start_time)}:{gcode_file}"
     # 兜底：用 occurred_at（秒级） + 文件名
     return f"{printer_id}:{int(ev.occurred_at.timestamp())}:{gcode_file}"
+
+
+async def _close_superseded_stub_jobs(
+    session: AsyncSession, *, printer_id: uuid.UUID, keep_job_id: uuid.UUID, now: datetime
+) -> None:
+    """
+    We sometimes receive early events without task_id / gcode_file, which creates "stub" running jobs.
+    When a "real" job later appears (task_id present), those stubs confuse the UI.
+
+    This routine marks recent stub running jobs as ended+settled to avoid further processing.
+    """
+    cutoff = now - timedelta(minutes=10)
+    stubs = (
+        await session.execute(
+            select(PrintJob).where(
+                PrintJob.printer_id == printer_id,
+                PrintJob.id != keep_job_id,
+                PrintJob.status == "running",
+                PrintJob.file_name.is_(None),
+                PrintJob.started_at >= cutoff,
+            )
+        )
+    ).scalars().all()
+    if not stubs:
+        return
+
+    for j in stubs:
+        j.status = "ended"
+        j.ended_at = j.ended_at or now
+        # prevent settlement attempt on this stub
+        j.spool_binding_snapshot_json = {
+            "settled_at": now.isoformat(),
+            "settle_error": "superseded_stub_job",
+        }
+        j.updated_at = now
 
 
 def _remain_by_tray(data: dict) -> dict[int, float]:
@@ -237,15 +272,18 @@ def _extract_filament_grams_by_tray(
       - "total": prefer total_g
     Returns: (grams_by_tray, source, confidence)
     """
-    # Strict mode: do NOT fallback to tray_now when we cannot uniquely map estimate to a tray.
-    # This is used for gcode-derived estimates where tray_id is unknown and mis-attribution is worse than no reservation.
-    if data.get("filament_strict_no_fallback") is True:
-        fallback_tray_now = None
-
     grams_by_tray: dict[int, int] = {}
     items = _filament_items(data)
     if not items:
         return ({}, "none", "low")
+
+    # Strict mode: do NOT fallback to tray_now when we cannot uniquely map estimate to a tray.
+    #
+    # Exception (safe): if this is a single-filament estimate (exactly one filament item),
+    # attributing it to the active tray is uniquely determined and is preferable to "no reservation".
+    strict_no_fallback = data.get("filament_strict_no_fallback") is True
+    if strict_no_fallback and not (fallback_tray_now is not None and len(items) == 1):
+        fallback_tray_now = None
 
     # Normalize tray meta lookup (keys may be str/int)
     tm: dict[str, dict] = {}
@@ -343,6 +381,11 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
         )
         session.add(job)
         await session.flush()
+
+        # If we created a "real" job (task_id/subtask_id present), close any recent stub running jobs.
+        data_task_id = data.get("task_id") or data.get("subtask_id")
+        if isinstance(data_task_id, (int, float)) or (isinstance(data_task_id, str) and data_task_id.strip()):
+            await _close_superseded_stub_jobs(session, printer_id=printer_id, keep_job_id=job.id, now=_utcnow())
 
     # 更新基础字段
     if file_name and not job.file_name:
