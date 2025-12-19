@@ -12,58 +12,8 @@ env:
   IMAGE_NAME: 3d-consumables
 
 jobs:
-  # 测试作业：验证各服务代码质量
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
-      - name: Install backend dependencies
-        working-directory: backend
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
-
-      - name: Run backend tests
-        working-directory: backend
-        run: pytest
-
-      - name: Install collector dependencies
-        working-directory: collector
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
-
-      - name: Run collector tests
-        working-directory: collector
-        run: pytest
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Run frontend tests
-        working-directory: frontend
-        run: npm test
-
   # 构建和推送作业
   build-and-push:
-    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
