@@ -1,77 +1,159 @@
-# 3D Consumables Management（拓竹耗材管理系统）
+# 3D耗材管理系统 (3D Consumables Management)
 
-本项目是一个可在局域网使用的拓竹耗材管理系统：通过 **LAN MQTT** 读取打印机状态与 AMS 托盘信息，结合耗材卷管理与托盘绑定，生成可审计的消耗账本与成本统计，并提供 Web UI 实时展示。
+一个专为拓竹打印机设计的局域网耗材管理系统，通过 **LAN MQTT** 连接打印机，实时监控打印状态与AMS托盘信息，自动记录耗材消耗并生成成本统计。
 
-## 目录结构
+## 核心功能
 
-- `backend/`：FastAPI + SQLAlchemy + Alembic（业务与 API）
-- `collector/`：MQTT 采集器（订阅 `device/<serial>/report` 并落库）
-- `frontend/`：Next.js Web UI
-- `docs/`：实现说明与局域网读取参考
-- `.github/workflows/`：GitHub Actions 工作流配置
+### 🖨️ 打印机管理与实时监控
+- **打印机接入管理**：支持添加/删除打印机，保存IP/序列号/LAN访问码
+- **实时状态监控**：自动获取并显示打印机在线状态、打印进度、当前任务
+- **MQTT数据采集**：通过局域网直连打印机，订阅设备报告并实时解析
+- **托盘信息展示**：显示当前使用托盘及所有AMS托盘状态（颜色、材质、剩余量）
 
-## 快速启动（Docker Compose）
+### 🧵 耗材卷管理
+- **耗材卷信息录入**：记录材质、颜色、初始重量、价格、供应商等详细信息
+- **托盘绑定管理**：支持将耗材卷绑定到打印机特定托盘，可随时解绑
+- **库存状态跟踪**：自动维护耗材卷状态（使用中、用完、报废等）
+- **库存调整记录**：支持手动盘点调整，保持库存数据准确性
 
-### 使用本地构建镜像
+### 📊 自动消耗记录与成本统计
+- **智能消耗计算**：打印结束时自动记录消耗，支持多种计算策略
+  - AMS剩余量差值（首选）
+  - 切片文件元数据估算（备选）
+  - 人工录入/纠错（兜底）
+- **自动成本核算**：根据耗材价格自动计算单次打印成本
+- **消耗记录追溯**：每条消耗记录关联具体打印任务和耗材卷
+- **多色打印支持**：支持多托盘打印的消耗分摊计算
 
-1) 复制环境变量模板并按需修改：
+### 📈 历史查询与报表
+- **打印任务历史**：记录所有打印任务详情，包括状态、时长、耗材消耗
+- **耗材卷账本**：查看每个耗材卷的完整使用历史和剩余量变化
+- **消耗统计报表**：按时间、材质、打印机等维度统计耗材使用情况
+- **数据导出功能**：支持将报表数据导出为CSV格式
 
-```bash
-cp env.example .env
+## 系统架构
+
+系统采用四层分离架构，确保各组件职责明确且易于维护：
+
+```
+┌───────────────────────┐
+│     Interface层        │  ← FastAPI REST + Next.js UI
+├───────────────────────┤
+│   Application层        │  ← 事件处理与业务逻辑
+├───────────────────────┤
+│     Domain层           │  ← 核心业务模型与规则
+├───────────────────────┤
+│  Infrastructure层      │  ← MQTT/数据库/缓存等基础服务
+└───────────────────────┘
 ```
 
-2) 启动：
-
-```bash
-docker compose up --build
+数据流向：
+```
+打印机MQTT → 采集器 → 标准化事件 → 业务处理 → 数据存储 → 实时UI更新
 ```
 
-3) 访问：
+## 部署指南
 
-- 后端 API：`http://localhost:8000/docs`
-- 前端 UI：`http://localhost:3000`
+### 系统要求
+- Docker 20.10+
+- Docker Compose v2.0+
+- 至少2GB可用内存
+- 至少5GB可用磁盘空间
 
-### 使用GitHub Container Registry镜像
+### 快速部署
 
-1) 复制GitHub Container Registry环境变量模板：
+1. **准备环境文件**
+   
+   创建环境配置文件：
+   ```bash
+   wget https://raw.githubusercontent.com/yangtao121/3d-consumables-management/main/env.ghcr.example -O .env
+   ```
+
+2. **配置环境变量**
+   
+   编辑 `.env` 文件，至少修改以下关键配置：
+   ```bash
+   # 修改为你的GitHub用户名或组织名
+   IMAGE_OWNER=your-username
+   
+   # 设置安全密钥
+   APP_SECRET_KEY=your-secure-secret-key
+   
+   # 设置前端访问地址（替换为你的服务器IP）
+   NEXT_PUBLIC_API_BASE_URL=http://your-server-ip:8000
+   ```
+
+3. **拉取并启动服务**
+   
+   ```bash
+   # 下载docker-compose配置
+   wget https://raw.githubusercontent.com/yangtao121/3d-consumables-management/main/docker-compose.ghcr.yml
+   
+   # 启动服务（会自动拉取镜像）
+   docker compose -f docker-compose.ghcr.yml up -d
+   ```
+
+4. **验证部署**
+   
+   检查服务状态：
+   ```bash
+   docker compose -f docker-compose.ghcr.yml ps
+   ```
+   
+   访问以下地址验证：
+   - 后端API文档：`http://your-server-ip:8000/docs`
+   - 前端界面：`http://your-server-ip:3000`
+
+### 镜像信息
+
+本系统使用以下预构建镜像（自动更新）：
+- API服务：`ghcr.io/yangtao121/3d-consumables-api:latest`
+- 采集器服务：`ghcr.io/yangtao121/3d-consumables-collector:latest`
+- 前端服务：`ghcr.io/yangtao121/3d-consumables-frontend:latest`
+
+如需使用特定版本，可修改 `.env` 文件中的 `IMAGE_TAG` 变量，例如 `IMAGE_TAG=v1.0.0`。
+
+### 常用运维命令
 
 ```bash
-cp env.ghcr.example .env
+# 查看日志
+docker compose -f docker-compose.ghcr.yml logs -f api
+docker compose -f docker-compose.ghcr.yml logs -f collector
+
+# 重启服务
+docker compose -f docker-compose.ghcr.yml restart api
+
+# 停止服务（保留数据）
+docker compose -f docker-compose.ghcr.yml down
+
+# 更新到最新版本
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-2) 修改.env文件中的IMAGE_OWNER为你的GitHub用户名或组织名
+## 快速开始
 
-3) 启动：
+1. **添加打印机**
+   - 登录系统后，进入"打印机"页面
+   - 点击"添加打印机"，输入打印机IP、序列号和LAN访问码
+   - 系统将自动连接并验证打印机状态
 
-```bash
-docker compose -f docker-compose.ghcr.yml up
-```
+2. **管理耗材卷**
+   - 进入"耗材"页面，添加你的3D打印耗材卷
+   - 记录材质、颜色、重量和价格等信息
+   - 将耗材卷绑定到打印机的特定托盘
 
-## GitHub Actions CI/CD
+3. **开始监控**
+   - 系统将自动监控打印机状态和耗材消耗
+   - 在"仪表盘"查看实时打印状态
+   - 在"历史记录"查看打印任务和耗材使用情况
 
-本项目使用GitHub Actions自动化Docker镜像的构建和推送：
+## 更多信息
 
-### 触发条件
-- 推送到main分支：构建并推送带有`latest`标签的镜像
-- 创建Git标签（vX.Y.Z格式）：构建并推送带有对应版本标签的镜像
+- **详细功能文档**：查看 `/docs` 目录下的实现说明
+- **问题反馈**：请在GitHub Issues中提交问题
+- **更新日志**：查看GitHub Releases了解版本更新
 
-### 构建流程
-1. 运行各服务的测试
-2. 并行构建三个服务的Docker镜像（api、collector、frontend）
-3. 推送镜像到GitHub Container Registry
+---
 
-### 镜像命名
-- API服务：`ghcr.io/你的用户名/3d-consumables-api:标签`
-- 采集器服务：`ghcr.io/你的用户名/3d-consumables-collector:标签`
-- 前端服务：`ghcr.io/你的用户名/3d-consumables-frontend:标签`
-
-### 使用预构建镜像
-如果你想使用预构建的镜像而不是本地构建，可以使用`docker-compose.ghcr.yml`文件。请确保先配置好`env.ghcr.example`中的环境变量。
-
-## 开发模式（不使用 Docker）
-
-- 后端：见 `backend/README.md`
-- 前端：见 `frontend/README.md`
-- 采集器：见 `collector/README.md`
-
-
+本项目采用MIT许可证，欢迎贡献代码和提出建议。
