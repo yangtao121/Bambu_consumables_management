@@ -243,6 +243,20 @@ def _normalize_remain_value(v: object) -> tuple[str, float] | None:
     """
     if not isinstance(v, (int, float)):
         return None
+    try:
+        fv = float(v)
+    except Exception:
+        return None
+    # NaN / invalid
+    if not (fv == fv):  # noqa: PLR0124
+        return None
+    if fv < 0:
+        return None
+    if fv <= 1.0:
+        return ("pct", fv * 100.0)
+    if fv <= 100.0:
+        return ("pct", fv)
+    return ("grams", fv)
 
 
 def _extract_progress_pct(data: dict, snap: dict | None = None) -> float | None:
@@ -432,14 +446,6 @@ async def _finalize_pre_deduct_settlement(
     if progress_pct is not None:
         snap2["final_progress_pct"] = float(progress_pct)
     job.spool_binding_snapshot_json = snap2
-    fv = float(v)
-    if fv < 0:
-        return None
-    if fv <= 1.0:
-        return ("pct", fv * 100.0)
-    if fv <= 100.0:
-        return ("pct", fv)
-    return ("grams", fv)
 
 
 def _filament_items(data: dict) -> list[dict]:

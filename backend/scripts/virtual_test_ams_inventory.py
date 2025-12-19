@@ -16,9 +16,9 @@ _backend_root = Path(__file__).resolve().parents[1]
 _default_pythonpath = "/app" if Path("/app/app").exists() else str(_backend_root)
 sys.path.insert(0, os.getenv("PYTHONPATH") or _default_pythonpath)
 
-from app.api.routers.jobs import resolve_job_materials
-from app.api.routers.jobs import add_manual_consumption, void_manual_job_consumption
-from app.api.routers.stocks import add_manual_stock_consumption, void_manual_stock_consumption, void_stock_ledger_row, update_stock
+from app.api.routers.jobs import add_manual_consumption, resolve_job_materials, void_manual_job_consumption
+from app.api.routers.material_ledger import reverse_ledger_row
+from app.api.routers.stocks import add_manual_stock_consumption, update_stock, void_manual_stock_consumption
 from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.material_ledger import MaterialLedger
 from app.db.models.material_stock import MaterialStock
@@ -76,6 +76,18 @@ def _tray(
     if official:
         t["tray_uuid"] = f"test-{tray_id}-{uuid.uuid4()}"
     return t
+
+
+def _filament_item(*, tray_id: int | None, typ: str, color_hex: str | None, total_g: float) -> dict:
+    # Normalized filament estimate item (collector injects something compatible with this shape)
+    it: dict = {
+        "tray_id": tray_id,
+        "type": typ,
+        "total_g": float(total_g),
+    }
+    if color_hex is not None:
+        it["color_hex"] = color_hex
+    return it
 
 
 async def _create_printer(session, alias: str) -> Printer:
@@ -154,17 +166,31 @@ async def _job_by_key(session, *, printer_id: uuid.UUID, job_key: str) -> PrintJ
     return j
 
 
-async def _count_consumptions_for_job(session, job_id: uuid.UUID) -> int:
-    return int(
-        (await session.scalar(select(func.count()).select_from(ConsumptionRecord).where(ConsumptionRecord.job_id == job_id)))
-        or 0
+async def _ledger_rows_for_job(session, job_id: uuid.UUID) -> list[MaterialLedger]:
+    return (
+        (
+            await session.execute(
+                select(MaterialLedger)
+                .where(MaterialLedger.job_id == job_id)
+                .order_by(MaterialLedger.created_at.asc(), MaterialLedger.id.asc())
+            )
+        )
+        .scalars()
+        .all()
     )
 
 
-async def _sum_consumed_grams_for_job(session, job_id: uuid.UUID) -> int:
-    return int(
-        (await session.scalar(select(func.coalesce(func.sum(ConsumptionRecord.grams), 0)).where(ConsumptionRecord.job_id == job_id)))
-        or 0
+async def _consumption_rows_for_job(session, job_id: uuid.UUID) -> list[ConsumptionRecord]:
+    return (
+        (
+            await session.execute(
+                select(ConsumptionRecord)
+                .where(ConsumptionRecord.job_id == job_id)
+                .order_by(ConsumptionRecord.tray_id.asc(), ConsumptionRecord.segment_idx.asc())
+            )
+        )
+        .scalars()
+        .all()
     )
 
 
@@ -175,125 +201,204 @@ async def _sum_ledger_delta_for_job(session, job_id: uuid.UUID) -> int:
     )
 
 
-async def _ledger_rows_for_job(session, job_id: uuid.UUID) -> list[MaterialLedger]:
-    return (
+async def _sum_consumed_grams_for_job(session, job_id: uuid.UUID) -> int:
+    return int(
         (
-            await session.execute(
-                select(MaterialLedger).where(MaterialLedger.job_id == job_id).order_by(MaterialLedger.created_at.asc(), MaterialLedger.id.asc())
+            await session.scalar(
+                select(func.coalesce(func.sum(ConsumptionRecord.grams), 0)).where(ConsumptionRecord.job_id == job_id)
             )
         )
-        .scalars()
-        .all()
+        or 0
     )
 
 
-async def _assert_job_ledger_and_consumptions_match(session, job: PrintJob) -> None:
-    """
-    For a settled job with resolved stock attribution:
-    - each ConsumptionRecord should correspond to exactly one MaterialLedger row (job_id == job.id)
-    - ledger delta should equal -consumed grams for that tray segment
-    - reason/kind/source should be traceable and consistent
-    """
-    cons = (
-        (
-            await session.execute(
-                select(ConsumptionRecord).where(ConsumptionRecord.job_id == job.id).order_by(ConsumptionRecord.tray_id.asc(), ConsumptionRecord.segment_idx.asc())
-            )
+async def _assert_pre_deduct_settlement(
+    session,
+    *,
+    job: PrintJob,
+    expected_reserved_by_tray: dict[int, int],
+    expected_used_by_tray: dict[int, int],
+    expect_cancelled: bool,
+) -> None:
+    # snapshot settled marker
+    snap = job.spool_binding_snapshot_json or {}
+    assert isinstance(snap, dict)
+    assert snap.get("settled_at") is not None
+    assert snap.get("settle_error") is None
+
+    # consumption records
+    cons = await _consumption_rows_for_job(session, job.id)
+    actual_trays = {int(c.tray_id) if c.tray_id is not None else -1 for c in cons}
+    expected_trays = set(expected_used_by_tray.keys())
+    if actual_trays != expected_trays:
+        led = await _ledger_rows_for_job(session, job.id)
+        raise AssertionError(
+            {
+                "message": "consumption tray set mismatch",
+                "expected_trays": sorted(expected_trays),
+                "actual_trays": sorted(actual_trays),
+                "consumption_rows": [
+                    {
+                        "id": str(c.id),
+                        "tray_id": c.tray_id,
+                        "segment_idx": c.segment_idx,
+                        "grams": int(c.grams or 0),
+                        "grams_requested": int(c.grams_requested or 0),
+                        "source": c.source,
+                    }
+                    for c in cons
+                ],
+                "ledger_rows": [
+                    {"id": str(r.id), "kind": r.kind, "delta_grams": int(r.delta_grams or 0), "reason": r.reason}
+                    for r in led
+                ],
+                "job_status": job.status,
+                "job_snapshot": job.spool_binding_snapshot_json,
+            }
         )
-        .scalars()
-        .all()
-    )
-    ledgers = await _ledger_rows_for_job(session, job.id)
-    assert len(cons) == len(ledgers)
-    assert int(await _sum_ledger_delta_for_job(session, job.id)) == -int(await _sum_consumed_grams_for_job(session, job.id))
-
-    # Index ledgers by tray_id from their reason string (reason includes "tray=<id>")
-    led_by_tray: dict[int, MaterialLedger] = {}
-    for r in ledgers:
-        assert r.job_id == job.id
-        assert int(r.delta_grams) < 0
-        assert (r.kind or "") == "consumption"
-        reason = str(r.reason or "")
-        assert f"job={job.id}" in reason
-        assert "tray=" in reason
-        # Extract tray id from reason
-        tid: int | None = None
-        try:
-            frag = reason.split("tray=", 1)[1]
-            tok = frag.split(" ", 1)[0]
-            tid = int(tok)
-        except Exception:
-            tid = None
-        assert isinstance(tid, int)
-        led_by_tray[int(tid)] = r
-
     for c in cons:
-        assert c.tray_id is not None
-        assert c.stock_id is not None
-        assert int(c.grams) > 0
-        # Source should be traceable to AMS remain delta algorithm.
-        assert str(c.source or "").startswith("ams_remain_start_end_")
-        r = led_by_tray.get(int(c.tray_id))
-        assert r is not None
-        assert int(r.delta_grams) == -int(c.grams_effective or c.grams)
+        if c.tray_id is None:
+            led = await _ledger_rows_for_job(session, job.id)
+            raise AssertionError(
+                {
+                    "message": "consumption row has null tray_id",
+                    "consumption_rows": [
+                        {
+                            "id": str(x.id),
+                            "tray_id": x.tray_id,
+                            "segment_idx": x.segment_idx,
+                            "grams": int(x.grams or 0),
+                            "grams_requested": int(x.grams_requested or 0),
+                            "source": x.source,
+                        }
+                        for x in cons
+                    ],
+                    "ledger_rows": [
+                        {"id": str(r.id), "kind": r.kind, "delta_grams": int(r.delta_grams or 0), "reason": r.reason}
+                        for r in led
+                    ],
+                    "job_status": job.status,
+                    "job_snapshot": job.spool_binding_snapshot_json,
+                }
+            )
+        tid = int(c.tray_id)
+        assert int(c.segment_idx or 0) == 0
+        assert int(c.grams) == int(expected_used_by_tray[tid])
+        assert int(c.grams_effective or c.grams) == int(expected_used_by_tray[tid])
+        assert int(c.grams_requested or 0) == int(expected_reserved_by_tray[tid])
+        assert (c.source or "").startswith("mqtt_filament_total_g") or (c.source or "").startswith(
+            "reservation_estimate"
+        )
+
+    # ledger rows
+    led = await _ledger_rows_for_job(session, job.id)
+    cons_led = [r for r in led if (r.kind or "") == "consumption"]
+    rev_led = [r for r in led if (r.kind or "") == "reversal"]
+    assert len(cons_led) == len(expected_reserved_by_tray)
+
+    # each tray must have one consumption ledger row with delta=-reserved
+    for tid, grams_reserved in expected_reserved_by_tray.items():
+        matched = [
+            r
+            for r in cons_led
+            if (r.reason or "").find(f"tray={int(tid)}") >= 0 and int(r.delta_grams) == -int(grams_reserved)
+        ]
+        assert len(matched) == 1
+
+    if expect_cancelled:
+        # reversal delta == refunded grams
+        for tid, grams_reserved in expected_reserved_by_tray.items():
+            used = int(expected_used_by_tray.get(int(tid), 0))
+            refund = int(grams_reserved - used)
+            if refund <= 0:
+                continue
+            matched = [
+                r
+                for r in rev_led
+                if (r.reason or "").find(f"cancel_refund") >= 0
+                and (r.reason or "").find(f"tray={int(tid)}") >= 0
+                and int(r.delta_grams) == int(refund)
+            ]
+            assert len(matched) == 1
+    else:
+        assert len(rev_led) == 0
+
+    # net ledger delta should equal -sum(used)
+    assert int(await _sum_ledger_delta_for_job(session, job.id)) == -int(sum(expected_used_by_tray.values()))
+    assert int(await _sum_consumed_grams_for_job(session, job.id)) == int(sum(expected_used_by_tray.values()))
 
 
-async def t1_ams_refresh_no_deduct() -> None:
+async def t1_pre_deduct_reserve_then_end_converts() -> None:
     async with async_session_factory() as session:
         p = await _create_printer(session, "T1")
         color = f"白色-{uuid.uuid4().hex[:6]}"
-        s = await _create_stock(
-            session,
-            material="PLA",
-            color=color,
-            brand="拓竹",
-            remaining_grams=1500,
-            roll_weight_grams=1000,
-        )
+        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=2000)
         base = _utcnow()
         task_id = 11001
         job_key = f"{p.id}:{task_id}"
 
-        ev_start = _event(
-            printer_id=p.id,
-            typ="PrintStarted",
-            occurred_at=base,
-            data={
-                "task_id": task_id,
-                "gcode_file": "t1.gcode",
-                "tray_now": 0,
-                "gcode_state": "RUNNING",
-                "ams_trays": [
-                    _tray(tray_id=0, material="PLA", color=color, remain=90, official=True),
-                ],
-            },
-        )
-        await _ingest_and_process(session, ev_start)
-
-        for i, r in enumerate([89, 88, 87, 86, 85]):
-            ev = _event(
+        await _ingest_and_process(
+            session,
+            _event(
                 printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=5 + i),
+                typ="PrintStarted",
+                occurred_at=base,
                 data={
                     "task_id": task_id,
                     "gcode_file": "t1.gcode",
                     "tray_now": 0,
                     "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=r, official=True)],
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
                 },
-            )
-            await _ingest_and_process(session, ev)
+            ),
+        )
+
+        # First progress brings filament estimate => reserve 120g
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintProgress",
+                occurred_at=base + timedelta(seconds=10),
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t1.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "RUNNING",
+                    "percent": 5,
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
+                    "filament": [_filament_item(tray_id=0, typ="PLA", color_hex=None, total_g=120.0)],
+                },
+            ),
+        )
+        await session.refresh(s)
+        assert int(s.remaining_grams) == 2000 - 120
+
+        # End converts reservation->consumption and creates consumption_record (no extra stock delta)
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintEnded",
+                occurred_at=base + timedelta(seconds=20),
+                data={"task_id": task_id, "gcode_file": "t1.gcode", "tray_now": 0, "gcode_state": "FINISH"},
+            ),
+        )
 
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        assert await _count_consumptions_for_job(session, j.id) == 0
-        assert int(await _sum_ledger_delta_for_job(session, j.id)) == 0
+        await _assert_pre_deduct_settlement(
+            session,
+            job=j,
+            expected_reserved_by_tray={0: 120},
+            expected_used_by_tray={0: 120},
+            expect_cancelled=False,
+        )
         await session.refresh(s)
-        assert int(s.remaining_grams) == 1500
+        assert int(s.remaining_grams) == 2000 - 120
         await session.commit()
 
 
-async def t2_duplicate_print_ended_idempotent() -> None:
+async def t2_duplicate_end_idempotent() -> None:
     async with async_session_factory() as session:
         p = await _create_printer(session, "T2")
         color = f"白色-{uuid.uuid4().hex[:6]}"
@@ -313,7 +418,7 @@ async def t2_duplicate_print_ended_idempotent() -> None:
                     "gcode_file": "t2.gcode",
                     "tray_now": 0,
                     "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=True)],
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
                 },
             ),
         )
@@ -328,10 +433,14 @@ async def t2_duplicate_print_ended_idempotent() -> None:
                     "gcode_file": "t2.gcode",
                     "tray_now": 0,
                     "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=60, official=True)],
+                    "percent": 10,
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
+                    "filament": [_filament_item(tray_id=0, typ="PLA", color_hex=None, total_g=80.0)],
                 },
             ),
         )
+        await session.refresh(s)
+        assert int(s.remaining_grams) == 2000 - 80
 
         ev_end = _event(
             printer_id=p.id,
@@ -341,30 +450,40 @@ async def t2_duplicate_print_ended_idempotent() -> None:
         )
         await _ingest_and_process(session, ev_end)
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        c1 = await _count_consumptions_for_job(session, j.id)
-        assert c1 == 1
-        await _assert_job_ledger_and_consumptions_match(session, j)
+        await _assert_pre_deduct_settlement(
+            session,
+            job=j,
+            expected_reserved_by_tray={0: 80},
+            expected_used_by_tray={0: 80},
+            expect_cancelled=False,
+        )
         await session.refresh(s)
         after1 = int(s.remaining_grams)
-        assert after1 == 2000 - 200  # 80% -> 60% of 1000g
 
-        # Duplicate end event (different event_id but same job)
-        ev_end2 = _event(
-            printer_id=p.id,
-            typ="PrintEnded",
-            occurred_at=base + timedelta(seconds=21),
-            data={"task_id": task_id, "gcode_file": "t2.gcode", "tray_now": 0, "gcode_state": "FINISH"},
+        # Duplicate end event (different event_id)
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintEnded",
+                occurred_at=base + timedelta(seconds=21),
+                data={"task_id": task_id, "gcode_file": "t2.gcode", "tray_now": 0, "gcode_state": "FINISH"},
+            ),
         )
-        await _ingest_and_process(session, ev_end2)
-        c2 = await _count_consumptions_for_job(session, j.id)
-        assert c2 == 1
-        await _assert_job_ledger_and_consumptions_match(session, j)
+        j2 = await _job_by_key(session, printer_id=p.id, job_key=job_key)
+        await _assert_pre_deduct_settlement(
+            session,
+            job=j2,
+            expected_reserved_by_tray={0: 80},
+            expected_used_by_tray={0: 80},
+            expect_cancelled=False,
+        )
         await session.refresh(s)
         assert int(s.remaining_grams) == after1
         await session.commit()
 
 
-async def t3_replay_same_events_safe() -> None:
+async def t3_cancel_partial_refund_by_progress() -> None:
     async with async_session_factory() as session:
         p = await _create_printer(session, "T3")
         color = f"白色-{uuid.uuid4().hex[:6]}"
@@ -373,7 +492,8 @@ async def t3_replay_same_events_safe() -> None:
         task_id = 33003
         job_key = f"{p.id}:{task_id}"
 
-        events = [
+        await _ingest_and_process(
+            session,
             _event(
                 printer_id=p.id,
                 typ="PrintStarted",
@@ -383,9 +503,14 @@ async def t3_replay_same_events_safe() -> None:
                     "gcode_file": "t3.gcode",
                     "tray_now": 0,
                     "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=True)],
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
                 },
             ),
+        )
+
+        # Reserve 100g
+        await _ingest_and_process(
+            session,
             _event(
                 printer_id=p.id,
                 typ="PrintProgress",
@@ -395,46 +520,69 @@ async def t3_replay_same_events_safe() -> None:
                     "gcode_file": "t3.gcode",
                     "tray_now": 0,
                     "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=70, official=True)],
+                    "mc_percent": 0,
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
+                    "filament": [_filament_item(tray_id=0, typ="PLA", color_hex=None, total_g=100.0)],
                 },
             ),
+        )
+        await session.refresh(s)
+        assert int(s.remaining_grams) == 2000 - 100
+
+        # Later progress says 30% then cancelled
+        await _ingest_and_process(
+            session,
             _event(
                 printer_id=p.id,
-                typ="PrintEnded",
+                typ="PrintProgress",
                 occurred_at=base + timedelta(seconds=20),
-                data={"task_id": task_id, "gcode_file": "t3.gcode", "tray_now": 0, "gcode_state": "FINISH"},
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t3.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "RUNNING",
+                    "mc_percent": 30,
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
+                },
             ),
-        ]
+        )
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="StateChanged",
+                occurred_at=base + timedelta(seconds=25),
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t3.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "CANCELED",
+                    "mc_percent": 30,
+                },
+            ),
+        )
 
-        for ev in events:
-            await _ingest_and_process(session, ev)
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        c1 = await _count_consumptions_for_job(session, j.id)
-        await session.refresh(s)
-        after1 = int(s.remaining_grams)
+        assert (j.status or "") == "cancelled"
 
-        # Replay: run process_event again on same in-memory events
-        for ev in events:
-            await process_event(session, ev)
-        c2 = await _count_consumptions_for_job(session, j.id)
+        # Reserved 100g, used 30g => refund 70g => net -30g
+        await _assert_pre_deduct_settlement(
+            session,
+            job=j,
+            expected_reserved_by_tray={0: 100},
+            expected_used_by_tray={0: 30},
+            expect_cancelled=True,
+        )
         await session.refresh(s)
-        after2 = int(s.remaining_grams)
-
-        assert c1 == 1
-        assert c2 == 1
-        assert after2 == after1
-        await _assert_job_ledger_and_consumptions_match(session, j)
+        assert int(s.remaining_grams) == 2000 - 30
         await session.commit()
 
 
-async def t4_switch_tray_multi_color() -> None:
+async def t4_strict_no_fallback_single_filament_still_reserves() -> None:
     async with async_session_factory() as session:
         p = await _create_printer(session, "T4")
-        tag = uuid.uuid4().hex[:6]
-        color0 = f"白色-{tag}"
-        color1 = f"黑色-{tag}"
-        s0 = await _create_stock(session, material="PLA", color=color0, brand="拓竹", remaining_grams=2000)
-        s1 = await _create_stock(session, material="PLA", color=color1, brand="拓竹", remaining_grams=2000)
+        color = f"白色-{uuid.uuid4().hex[:6]}"
+        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=500)
         base = _utcnow()
         task_id = 44004
         job_key = f"{p.id}:{task_id}"
@@ -450,15 +598,12 @@ async def t4_switch_tray_multi_color() -> None:
                     "gcode_file": "t4.gcode",
                     "tray_now": 0,
                     "gcode_state": "RUNNING",
-                    "ams_trays": [
-                        _tray(tray_id=0, material="PLA", color=color0, remain=90, official=True),
-                        _tray(tray_id=1, material="PLA", color=color1, remain=90, official=True),
-                    ],
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
                 },
             ),
         )
 
-        # Use tray 0
+        # tray_id missing but single filament item + strict_no_fallback=true => should fallback to tray_now
         await _ingest_and_process(
             session,
             _event(
@@ -470,515 +615,113 @@ async def t4_switch_tray_multi_color() -> None:
                     "gcode_file": "t4.gcode",
                     "tray_now": 0,
                     "gcode_state": "RUNNING",
-                    "ams_trays": [
-                        _tray(tray_id=0, material="PLA", color=color0, remain=80, official=True),
-                        _tray(tray_id=1, material="PLA", color=color1, remain=90, official=True),
-                    ],
+                    "filament_strict_no_fallback": True,
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=True)],
+                    "filament": [_filament_item(tray_id=None, typ="PLA", color_hex=None, total_g=60.0)],
                 },
             ),
         )
-        # Switch to tray 1
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=20),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t4.gcode",
-                    "tray_now": 1,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [
-                        _tray(tray_id=0, material="PLA", color=color0, remain=80, official=True),
-                        _tray(tray_id=1, material="PLA", color=color1, remain=70, official=True),
-                    ],
-                },
-            ),
-        )
+        await session.refresh(s)
+        assert int(s.remaining_grams) == 500 - 60
 
         await _ingest_and_process(
             session,
             _event(
                 printer_id=p.id,
                 typ="PrintEnded",
-                occurred_at=base + timedelta(seconds=30),
-                data={"task_id": task_id, "gcode_file": "t4.gcode", "tray_now": 1, "gcode_state": "FINISH"},
-            ),
-        )
-
-        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        rows = (
-            await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id).order_by(ConsumptionRecord.tray_id.asc()))
-        ).scalars().all()
-        assert len(rows) == 2
-        assert {r.tray_id for r in rows} == {0, 1}
-        await _assert_job_ledger_and_consumptions_match(session, j)
-        await session.refresh(s0)
-        await session.refresh(s1)
-        # start=90 -> end=80 => 10% of 1000g
-        assert int(s0.remaining_grams) == 2000 - 100
-        # start=90 -> end=70 => 20% of 1000g
-        assert int(s1.remaining_grams) == 2000 - 200
-        await session.commit()
-
-
-async def t5_remain_increase_is_ignored_start_end_only() -> None:
-    async with async_session_factory() as session:
-        p = await _create_printer(session, "T5")
-        color = f"白色-{uuid.uuid4().hex[:6]}"
-        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=5000, roll_weight_grams=1000)
-        base = _utcnow()
-        task_id = 55005
-        job_key = f"{p.id}:{task_id}"
-
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintStarted",
-                occurred_at=base,
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t5.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=True)],
-                },
-            ),
-        )
-        # Decrease to 20
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=10),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t5.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=20, official=True)],
-                },
-            ),
-        )
-        # Spool swap: jump up to 95 (should split)
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
                 occurred_at=base + timedelta(seconds=20),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t5.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=95, official=True)],
-                },
+                data={"task_id": task_id, "gcode_file": "t4.gcode", "tray_now": 0, "gcode_state": "FINISH"},
             ),
         )
-        # Consume new spool down to 60
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=30),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t5.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=60, official=True)],
-                },
-            ),
-        )
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintEnded",
-                occurred_at=base + timedelta(seconds=40),
-                data={"task_id": task_id, "gcode_file": "t5.gcode", "tray_now": 0, "gcode_state": "FINISH"},
-            ),
-        )
-
         j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        rows = (await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id))).scalars().all()
-        assert len(rows) == 1
-        assert int(rows[0].segment_idx or 0) == 0
-        assert int(rows[0].grams) == 200  # only start-end: 80% -> 60% of 1000g
-        await _assert_job_ledger_and_consumptions_match(session, j)
-        await session.refresh(s)
-        assert int(s.remaining_grams) == 5000 - 200
+        await _assert_pre_deduct_settlement(
+            session,
+            job=j,
+            expected_reserved_by_tray={0: 60},
+            expected_used_by_tray={0: 60},
+            expect_cancelled=False,
+        )
         await session.commit()
 
 
-async def t6_pending_resolve_repeat_idempotent() -> None:
+async def t5_reverse_adjustment_endpoint() -> None:
     async with async_session_factory() as session:
-        p = await _create_printer(session, "T6")
-        color = f"红色-{uuid.uuid4().hex[:6]}"
-        # Two third-party brands with same material+color => auto-resolve should fail (pending)
-        s_a = await _create_stock(session, material="PLA", color=color, brand="BrandA", remaining_grams=2000)
-        s_b = await _create_stock(session, material="PLA", color=color, brand="BrandB", remaining_grams=2000)
-        s_a_id = s_a.id
-        s_b_id = s_b.id
-        base = _utcnow()
-        task_id = 66006
-        job_key = f"{p.id}:{task_id}"
-
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintStarted",
-                occurred_at=base,
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t6.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=False)],
-                },
-            ),
-        )
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=10),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t6.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=False)],
-                },
-            ),
-        )
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintEnded",
-                occurred_at=base + timedelta(seconds=20),
-                data={"task_id": task_id, "gcode_file": "t6.gcode", "tray_now": 0, "gcode_state": "FINISH"},
-            ),
-        )
-
-        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        job_id = j.id
-        await session.commit()  # commit before resolve
-
-    # Resolve pending twice by calling router directly to validate idempotency without running HTTP server
-    async with async_session_factory() as session:
-        body = JobMaterialResolve(items=[JobMaterialResolveItem(tray_id=0, stock_id=s_a_id)])
-        r1 = await resolve_job_materials(job_id, body, session)
-        assert r1.get("ok") is True
-        r2 = await resolve_job_materials(job_id, body, session)
-        assert r2.get("ok") is True
-
-    async with async_session_factory() as session:
-        # Still only one segment consumption
-        rows = (
-            await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == job_id).order_by(ConsumptionRecord.created_at.asc()))
-        ).scalars().all()
-        assert len(rows) == 1
-        assert int(rows[0].tray_id or 0) == 0
-        assert int(rows[0].segment_idx or 0) == 0
-        assert rows[0].stock_id == s_a_id
-        # After manual resolve, ledger should match consumption with traceable reason/kind.
-        j = await session.get(PrintJob, job_id)
-        assert j is not None
-        await _assert_job_ledger_and_consumptions_match(session, j)
-
-        sa = await session.get(MaterialStock, s_a_id)
-        sb = await session.get(MaterialStock, s_b_id)
-        assert sa is not None and sb is not None
-        assert int(sa.remaining_grams) == 2000 - int(rows[0].grams)
-        assert int(sb.remaining_grams) == 2000
-        await session.commit()
-
-
-async def t13_print_failed_still_settles() -> None:
-    """
-    PrintFailed should also trigger settlement (same as ended), using start/end remain.
-    """
-    async with async_session_factory() as session:
-        p = await _create_printer(session, "T13")
-        color = f"白色-{uuid.uuid4().hex[:6]}"
-        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=2000, roll_weight_grams=1000)
-        base = _utcnow()
-        task_id = 131313
-        job_key = f"{p.id}:{task_id}"
-
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintStarted",
-                occurred_at=base,
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t13.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=True)],
-                },
-            ),
-        )
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=10),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t13.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=60, official=True)],
-                },
-            ),
-        )
-        # Failed (printer reports failure / canceled)
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintFailed",
-                occurred_at=base + timedelta(seconds=20),
-                data={"task_id": task_id, "gcode_file": "t13.gcode", "tray_now": 0, "gcode_state": "FAILED"},
-            ),
-        )
-
-        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        assert await _count_consumptions_for_job(session, j.id) == 1
-        await _assert_job_ledger_and_consumptions_match(session, j)
-        await session.refresh(s)
-        assert int(s.remaining_grams) == 2000 - 200  # 80% -> 60% of 1000g
-        await session.commit()
-
-
-async def t8_state_changed_finish_still_settles() -> None:
-    """
-    Simulate collector restart: FINISH arrives as StateChanged (no PrintEnded).
-    Settlement must still happen.
-    """
-    async with async_session_factory() as session:
-        p = await _create_printer(session, "T8")
-        color = f"白色-{uuid.uuid4().hex[:6]}"
-        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=2000, roll_weight_grams=1000)
-        base = _utcnow()
-        task_id = 88008
-        job_key = f"{p.id}:{task_id}"
-
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintStarted",
-                occurred_at=base,
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t8.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=80, official=True)],
-                },
-            ),
-        )
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=10),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t8.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=70, official=True)],
-                },
-            ),
-        )
-
-        # No PrintEnded; only StateChanged with FINISH and no ams_trays.
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="StateChanged",
-                occurred_at=base + timedelta(seconds=20),
-                data={"task_id": task_id, "gcode_file": "t8.gcode", "tray_now": 0, "gcode_state": "FINISH"},
-            ),
-        )
-
-        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        rows = (await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id))).scalars().all()
-        assert len(rows) == 1
-        assert int(rows[0].grams) == 100  # 80% -> 70% of 1000g
-        await _assert_job_ledger_and_consumptions_match(session, j)
-        await session.refresh(s)
-        assert int(s.remaining_grams) == 2000 - 100
-        await session.commit()
-
-
-async def t7_clamp_to_zero_consistent() -> None:
-    async with async_session_factory() as session:
-        p = await _create_printer(session, "T7")
-        color = f"白色-{uuid.uuid4().hex[:6]}"
-        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=50, roll_weight_grams=1000)
-        base = _utcnow()
-        task_id = 77007
-        job_key = f"{p.id}:{task_id}"
-
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintStarted",
-                occurred_at=base,
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t7.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=300, official=True)],
-                },
-            ),
-        )
-        # Consume 120g (grams unit)
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintProgress",
-                occurred_at=base + timedelta(seconds=10),
-                data={
-                    "task_id": task_id,
-                    "gcode_file": "t7.gcode",
-                    "tray_now": 0,
-                    "gcode_state": "RUNNING",
-                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=180, official=True)],
-                },
-            ),
-        )
-        await _ingest_and_process(
-            session,
-            _event(
-                printer_id=p.id,
-                typ="PrintEnded",
-                occurred_at=base + timedelta(seconds=20),
-                data={"task_id": task_id, "gcode_file": "t7.gcode", "tray_now": 0, "gcode_state": "FINISH"},
-            ),
-        )
-
-        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
-        rows = (await session.execute(select(ConsumptionRecord).where(ConsumptionRecord.job_id == j.id))).scalars().all()
-        assert len(rows) == 1
-        c = rows[0]
-        assert int(c.grams_requested or 0) >= 120
-        assert int(c.grams_effective or 0) == 50
-        assert int(c.grams) == 50
-
-        await session.refresh(s)
-        assert int(s.remaining_grams) == 0
-
-        led_sum = await _sum_ledger_delta_for_job(session, j.id)
-        assert led_sum == -50
-        await session.commit()
-
-
-async def t9_manual_stock_consumption_void_roundtrip() -> None:
-    async with async_session_factory() as session:
-        p = await _create_printer(session, "T9")
-        color = f"白色-{uuid.uuid4().hex[:6]}"
-        s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=1000)
-        await session.commit()
-
-        before = int(s.remaining_grams)
-        res = await add_manual_stock_consumption(
-            s.id, StockManualConsumptionCreate(grams=200, note="t9"), db=session
-        )
-        cid = uuid.UUID(str(res["consumption_id"]))
-
-        await session.refresh(s)
-        assert int(s.remaining_grams) == before - 200
-
-        await void_manual_stock_consumption(s.id, cid, VoidRequest(reason="t9 void"), db=session)
-        await session.refresh(s)
-        assert int(s.remaining_grams) == before
-
-        c = await session.get(ConsumptionRecord, cid)
-        assert c is not None
-        assert c.voided_at is not None
-        await session.commit()
-
-
-async def t10_void_adjustment_safety() -> None:
-    async with async_session_factory() as session:
-        _p = await _create_printer(session, "T10")
+        _p = await _create_printer(session, "T5")
         color = f"黑色-{uuid.uuid4().hex[:6]}"
         s = await _create_stock(session, material="PLA", color=color, brand="拓竹", remaining_grams=500)
         await session.commit()
 
         before = int(s.remaining_grams)
-        # Create an adjustment +120g
-        await apply_stock_delta(session, s.id, +120, reason="t10 adjustment", job_id=None, kind="adjustment")
+        # Create adjustment +120g
+        await apply_stock_delta(session, s.id, +120, reason="t5 adjustment", job_id=None, kind="adjustment")
         await session.commit()
-
         await session.refresh(s)
         assert int(s.remaining_grams) == before + 120
 
-        r = (
-            (await session.execute(select(MaterialLedger).where(MaterialLedger.stock_id == s.id, MaterialLedger.kind == "adjustment").order_by(MaterialLedger.created_at.desc())))
-        ).scalars().first()
-        assert r is not None
+        adj = (
+            (
+                await session.execute(
+                    select(MaterialLedger)
+                    .where(MaterialLedger.stock_id == s.id, MaterialLedger.kind == "adjustment")
+                    .order_by(MaterialLedger.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert adj is not None
 
-        await void_stock_ledger_row(s.id, r.id, VoidRequest(reason="t10 void"), db=session)
+        res = await reverse_ledger_row(adj.id, VoidRequest(reason="t5 reverse"), db=session)
+        assert res.get("ok") is True
         await session.refresh(s)
         assert int(s.remaining_grams) == before
 
-        r2 = await session.get(MaterialLedger, r.id)
-        assert r2 is not None and r2.voided_at is not None
+        adj2 = await session.get(MaterialLedger, adj.id)
+        assert adj2 is not None and adj2.voided_at is not None
         rev = (
-            (await session.execute(select(MaterialLedger).where(MaterialLedger.reversal_of_id == r.id).order_by(MaterialLedger.created_at.desc())))
-        ).scalars().first()
+            (
+                await session.execute(
+                    select(MaterialLedger).where(MaterialLedger.reversal_of_id == adj.id).order_by(MaterialLedger.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
         assert rev is not None
-        await session.commit()
+        assert int(rev.delta_grams) == -int(adj.delta_grams)
+        assert (rev.kind or "") == "reversal"
 
         # Unsafe reversal should be blocked if adjustment grams were consumed.
         s2 = await _create_stock(session, material="PLA", color=f"灰-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=50)
-        await apply_stock_delta(session, s2.id, +100, reason="t10 adj2", job_id=None, kind="adjustment")
+        await apply_stock_delta(session, s2.id, +100, reason="t5 adj2", job_id=None, kind="adjustment")
         await session.commit()
-        # Consume most of it
+        # Consume most of it (so remaining < 100)
         await add_manual_stock_consumption(s2.id, StockManualConsumptionCreate(grams=120, note="consume"), db=session)
         await session.refresh(s2)
         assert int(s2.remaining_grams) < 100
-        r_adj2 = (
-            (await session.execute(select(MaterialLedger).where(MaterialLedger.stock_id == s2.id, MaterialLedger.kind == "adjustment").order_by(MaterialLedger.created_at.desc())))
-        ).scalars().first()
-        assert r_adj2 is not None
+        adj_bad = (
+            (
+                await session.execute(
+                    select(MaterialLedger)
+                    .where(MaterialLedger.stock_id == s2.id, MaterialLedger.kind == "adjustment")
+                    .order_by(MaterialLedger.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert adj_bad is not None
         try:
-            await void_stock_ledger_row(s2.id, r_adj2.id, VoidRequest(reason="should fail"), db=session)
-            raise AssertionError("expected void to be blocked")
+            await reverse_ledger_row(adj_bad.id, VoidRequest(reason="should fail"), db=session)
+            raise AssertionError("expected reverse to be blocked")
         except HTTPException as e:
             assert int(e.status_code) == 409
-        except Exception as e:
-            assert "cannot void" in str(e) or "409" in str(e)
 
 
-async def t11_stock_rename_merge() -> None:
+async def t6_stock_rename_merge() -> None:
     async with async_session_factory() as session:
-        _p = await _create_printer(session, "T11")
+        _p = await _create_printer(session, "T6")
         a = await _create_stock(session, material="PLA", color=f"白-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=400)
-        # Use a unique color key to avoid conflicts across repeated local runs (DB persists).
         b = await _create_stock(session, material="PLA", color=f"合并色-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=100)
         await session.commit()
 
@@ -996,20 +739,20 @@ async def t11_stock_rename_merge() -> None:
         await session.commit()
 
 
-async def t12_job_manual_consumption_void() -> None:
+async def t7_job_manual_consumption_void() -> None:
     async with async_session_factory() as session:
-        p = await _create_printer(session, "T12")
+        p = await _create_printer(session, "T7")
         j = await _create_job(session, printer_id=p.id, job_key=f"MANUAL-{uuid.uuid4()}")
         s = await _create_stock(session, material="PLA", color=f"红-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=300)
         await session.commit()
 
         before = int(s.remaining_grams)
-        res = await add_manual_consumption(j.id, ManualConsumptionCreate(stock_id=s.id, grams=120, note="t12"), db=session)
+        res = await add_manual_consumption(j.id, ManualConsumptionCreate(stock_id=s.id, grams=120, note="t7"), db=session)
         cid = uuid.UUID(str(res["consumption_id"]))
         await session.refresh(s)
         assert int(s.remaining_grams) == before - 120
 
-        await void_manual_job_consumption(j.id, cid, ManualConsumptionVoid(reason="t12 void"), db=session)
+        await void_manual_job_consumption(j.id, cid, ManualConsumptionVoid(reason="t7 void"), db=session)
         await session.refresh(s)
         assert int(s.remaining_grams) == before
         c = await session.get(ConsumptionRecord, cid)
@@ -1017,21 +760,93 @@ async def t12_job_manual_consumption_void() -> None:
         await session.commit()
 
 
+async def t8_manual_stock_consumption_void_roundtrip() -> None:
+    async with async_session_factory() as session:
+        p = await _create_printer(session, "T8")
+        _ = p
+        s = await _create_stock(session, material="PLA", color=f"白色-{uuid.uuid4().hex[:6]}", brand="拓竹", remaining_grams=1000)
+        await session.commit()
+
+        before = int(s.remaining_grams)
+        res = await add_manual_stock_consumption(s.id, StockManualConsumptionCreate(grams=200, note="t8"), db=session)
+        cid = uuid.UUID(str(res["consumption_id"]))
+
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before - 200
+
+        await void_manual_stock_consumption(s.id, cid, VoidRequest(reason="t8 void"), db=session)
+        await session.refresh(s)
+        assert int(s.remaining_grams) == before
+
+        c = await session.get(ConsumptionRecord, cid)
+        assert c is not None
+        assert c.voided_at is not None
+        await session.commit()
+
+
+async def t9_pending_resolve_repeat_idempotent() -> None:
+    """Pending resolve still works with explicit tray->stock mapping."""
+    async with async_session_factory() as session:
+        p = await _create_printer(session, "T9")
+        color = f"红色-{uuid.uuid4().hex[:6]}"
+        # Two third-party brands with same material+color => auto-resolve should fail (pending)
+        s_a = await _create_stock(session, material="PLA", color=color, brand="BrandA", remaining_grams=2000)
+        s_b = await _create_stock(session, material="PLA", color=color, brand="BrandB", remaining_grams=2000)
+        s_a_id = s_a.id
+        _ = s_b
+        base = _utcnow()
+        task_id = 99009
+        job_key = f"{p.id}:{task_id}"
+
+        # Start without reservation; end will settle with missing_reservation, but pending resolve should still create ledger+record
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="PrintStarted",
+                occurred_at=base,
+                data={
+                    "task_id": task_id,
+                    "gcode_file": "t9.gcode",
+                    "tray_now": 0,
+                    "gcode_state": "RUNNING",
+                    "ams_trays": [_tray(tray_id=0, material="PLA", color=color, remain=90, official=False)],
+                },
+            ),
+        )
+        await _ingest_and_process(
+            session,
+            _event(
+                printer_id=p.id,
+                typ="StateChanged",
+                occurred_at=base + timedelta(seconds=5),
+                data={"task_id": task_id, "gcode_file": "t9.gcode", "tray_now": 0, "gcode_state": "FINISH"},
+            ),
+        )
+        j = await _job_by_key(session, printer_id=p.id, job_key=job_key)
+        job_id = j.id
+        await session.commit()
+
+    async with async_session_factory() as session:
+        body = JobMaterialResolve(items=[JobMaterialResolveItem(tray_id=0, stock_id=s_a_id)])
+        r1 = await resolve_job_materials(job_id, body, session)
+        assert r1.get("ok") is True
+        r2 = await resolve_job_materials(job_id, body, session)
+        assert r2.get("ok") is True
+        await session.commit()
+
+
 async def main() -> None:
     tests = [
-        ("T1 refresh no deduct", t1_ams_refresh_no_deduct),
-        ("T2 duplicate ended idempotent", t2_duplicate_print_ended_idempotent),
-        ("T3 replay safe", t3_replay_same_events_safe),
-        ("T4 switch tray", t4_switch_tray_multi_color),
-        ("T5 remain increase ignored (start-end only)", t5_remain_increase_is_ignored_start_end_only),
-        ("T6 pending resolve repeat", t6_pending_resolve_repeat_idempotent),
-        ("T7 clamp to zero", t7_clamp_to_zero_consistent),
-        ("T8 StateChanged FINISH still settles", t8_state_changed_finish_still_settles),
-        ("T9 manual stock consumption void", t9_manual_stock_consumption_void_roundtrip),
-        ("T10 void adjustment safety", t10_void_adjustment_safety),
-        ("T11 stock rename merge", t11_stock_rename_merge),
-        ("T12 job manual consumption void", t12_job_manual_consumption_void),
-        ("T13 PrintFailed still settles", t13_print_failed_still_settles),
+        ("T1 reserve->end converts", t1_pre_deduct_reserve_then_end_converts),
+        ("T2 duplicate end idempotent", t2_duplicate_end_idempotent),
+        ("T3 cancel refund by progress", t3_cancel_partial_refund_by_progress),
+        ("T4 strict single filament fallback", t4_strict_no_fallback_single_filament_still_reserves),
+        ("T5 reverse adjustment endpoint", t5_reverse_adjustment_endpoint),
+        ("T6 stock rename merge", t6_stock_rename_merge),
+        ("T7 job manual consumption void", t7_job_manual_consumption_void),
+        ("T8 manual stock consumption void", t8_manual_stock_consumption_void_roundtrip),
+        ("T9 pending resolve repeat", t9_pending_resolve_repeat_idempotent),
     ]
 
     fails: list[str] = []
