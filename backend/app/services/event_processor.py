@@ -14,6 +14,7 @@ from app.db.models.material_stock import MaterialStock
 from app.db.models.normalized_event import NormalizedEvent
 from app.db.models.print_job import PrintJob
 from app.services.stock_service import apply_stock_delta
+from app.core.config import settings
 
 
 def _utcnow() -> datetime:
@@ -242,6 +243,195 @@ def _normalize_remain_value(v: object) -> tuple[str, float] | None:
     """
     if not isinstance(v, (int, float)):
         return None
+
+
+def _extract_progress_pct(data: dict, snap: dict | None = None) -> float | None:
+    """
+    Best-effort extraction of print progress percentage (0~100).
+    Different firmware/app payloads may use different keys.
+    """
+    candidates: list[object] = []
+    for k in (
+        "progress",
+        "print_progress",
+        "gcode_progress",
+        "gcode_percent",
+        "percent",
+        "mc_percent",
+        "mc_percent_remain",
+    ):
+        if k in data:
+            candidates.append(data.get(k))
+    if isinstance(snap, dict) and "last_progress_pct" in snap:
+        candidates.append(snap.get("last_progress_pct"))
+
+    for v in candidates:
+        try:
+            fv = float(v)  # type: ignore[arg-type]
+        except Exception:
+            continue
+        if not (fv >= 0):
+            continue
+        # 0~1 fraction
+        if 0.0 <= fv <= 1.0:
+            return fv * 100.0
+        # 0~100
+        if 0.0 <= fv <= 100.0:
+            return fv
+        # sometimes 0~10000 (basis points)
+        if 100.0 < fv <= 10000.0:
+            return fv / 100.0
+    return None
+
+
+async def _finalize_pre_deduct_settlement(
+    session: AsyncSession,
+    *,
+    job: PrintJob,
+    data: dict,
+    now,
+) -> None:
+    """
+    Pre-deduct only:
+    - On end: convert reservation ledger rows -> consumption (no stock delta)
+    - Create consumption_records from reserved grams (for reporting/UI)
+    - If cancelled: refund a portion by progress (write reversal ledger + adjust consumption_records grams)
+    """
+    snap = job.spool_binding_snapshot_json or {}
+    if not isinstance(snap, dict):
+        snap = {}
+    if snap.get("settled_at"):
+        return
+
+    reserved_by_tray = dict(snap.get("reserved_by_tray")) if isinstance(snap.get("reserved_by_tray"), dict) else {}
+    reserved_stock_by_tray = (
+        dict(snap.get("reserved_stock_by_tray")) if isinstance(snap.get("reserved_stock_by_tray"), dict) else {}
+    )
+    if not reserved_by_tray:
+        snap2 = dict(snap)
+        snap2["settled_at"] = now.isoformat()
+        snap2["settle_error"] = "missing_reservation"
+        job.spool_binding_snapshot_json = snap2
+        return
+
+    reserved_source = str(snap.get("reserved_source") or "reservation_estimate")
+    reserved_confidence = str(snap.get("reserved_confidence") or "medium")
+
+    # Cancellation refund by progress (0~100)
+    progress_pct = _extract_progress_pct(data, snap)
+    progress_frac = None
+    if isinstance(progress_pct, (int, float)):
+        progress_frac = max(0.0, min(1.0, float(progress_pct) / 100.0))
+    is_cancelled = (job.status == "cancelled")
+
+    # Convert reservation ledger rows to consumption (label change only).
+    # We convert by (job_id, stock_id, kind) to avoid parsing reason text.
+    # Note: apply_stock_delta already happened at reservation time.
+    for tid_s, grams_reserved in reserved_by_tray.items():
+        try:
+            tid = int(tid_s)
+        except Exception:
+            continue
+        try:
+            grams_i = int(float(grams_reserved))
+        except Exception:
+            grams_i = 0
+        if grams_i <= 0:
+            continue
+
+        stock_id_s = reserved_stock_by_tray.get(str(tid))
+        if not stock_id_s:
+            continue
+        try:
+            stock_uuid = uuid.UUID(str(stock_id_s))
+        except Exception:
+            continue
+
+        # Find the reservation ledger row (should be exactly one per (job, stock, tray)).
+        # We match tray via reason to be consistent with existing write path.
+        reservation_row = (
+            await session.execute(
+                select(MaterialLedger)
+                .where(
+                    MaterialLedger.job_id == job.id,
+                    MaterialLedger.stock_id == stock_uuid,
+                    MaterialLedger.kind.in_(["reservation", "consumption"]),
+                    MaterialLedger.reason.like(f"%tray={tid}%"),
+                )
+                .order_by(MaterialLedger.created_at.asc())
+            )
+        ).scalars().first()
+
+        if reservation_row and (reservation_row.kind or "") == "reservation":
+            reservation_row.kind = "consumption"
+            if reservation_row.reason and reservation_row.reason.startswith("reservation "):
+                reservation_row.reason = reservation_row.reason.replace("reservation ", "consumption ", 1)
+
+        # Determine effective consumption grams (cancel can refund part).
+        grams_refund = 0
+        if is_cancelled and progress_frac is not None:
+            grams_refund = int(round(float(grams_i) * (1.0 - float(progress_frac))))
+            grams_refund = max(0, min(int(grams_i), int(grams_refund)))
+        grams_used = int(grams_i - grams_refund)
+
+        # Idempotent create (unique index job_id+tray_id+segment_idx).
+        segment_idx = 0
+        exists = await session.scalar(
+            select(ConsumptionRecord.id).where(
+                ConsumptionRecord.job_id == job.id,
+                ConsumptionRecord.tray_id == int(tid),
+                ConsumptionRecord.segment_idx == int(segment_idx),
+            )
+        )
+        if not exists and grams_used > 0:
+            session.add(
+                ConsumptionRecord(
+                    job_id=job.id,
+                    spool_id=None,
+                    stock_id=stock_uuid,
+                    tray_id=int(tid),
+                    segment_idx=int(segment_idx),
+                    grams=int(grams_used),
+                    grams_requested=int(grams_i),
+                    grams_effective=int(grams_used),
+                    source=("reservation_estimate_cancel_progress" if is_cancelled else reserved_source),
+                    confidence=str(reserved_confidence),
+                    created_at=now,
+                )
+            )
+            await session.flush()
+
+        # Refund ledger (stock delta positive) with reversal_of_id pointing to reservation row if possible.
+        if is_cancelled and grams_refund > 0:
+            already_refunded = await session.scalar(
+                select(MaterialLedger.id).where(
+                    MaterialLedger.job_id == job.id,
+                    MaterialLedger.kind == "reversal",
+                    MaterialLedger.reason.like(f"%cancel_refund%tray={tid}%"),
+                )
+            )
+            if already_refunded:
+                continue
+            reversal_of_id = reservation_row.id if reservation_row else None
+            await apply_stock_delta(
+                session,
+                stock_uuid,
+                +int(grams_refund),
+                reason=(
+                    f"cancel_refund job={job.id} tray={tid} "
+                    f"progress_pct={round(float(progress_pct or 0.0), 2) if progress_pct is not None else 'unknown'}"
+                ),
+                job_id=job.id,
+                kind="reversal",
+                reversal_of_id=reversal_of_id,
+            )
+
+    snap2 = dict(snap)
+    snap2["settled_at"] = now.isoformat()
+    snap2["settle_error"] = None
+    if progress_pct is not None:
+        snap2["final_progress_pct"] = float(progress_pct)
+    job.spool_binding_snapshot_json = snap2
     fv = float(v)
     if fv < 0:
         return None
@@ -500,14 +690,17 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             if gcode_state in {"FINISH", "IDLE"}:
                 job.status = "ended"
                 job.ended_at = job.ended_at or ev.occurred_at
-            elif gcode_state in {"FAILED", "STOPPED", "CANCELED"}:
+            elif gcode_state in {"CANCELED", "CANCELLED"}:
+                job.status = "cancelled"
+                job.ended_at = job.ended_at or ev.occurred_at
+            elif gcode_state in {"FAILED", "STOPPED"}:
                 job.status = "failed"
                 job.ended_at = job.ended_at or ev.occurred_at
             else:
-                if job.status not in {"ended", "failed"}:
+                if job.status not in {"ended", "failed", "cancelled"}:
                     job.status = "running"
         else:
-            if job.status not in {"ended", "failed"}:
+            if job.status not in {"ended", "failed", "cancelled"}:
                 job.status = "running"
 
         # Cold-start / mid-print takeover: if snapshot missing, initialize from current progress event.
@@ -681,16 +874,34 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
                     snap2["reserved_at"] = _utcnow().isoformat()
                     job.spool_binding_snapshot_json = snap2
 
+        # Track last-known progress pct (used for cancel refund).
+        snap = job.spool_binding_snapshot_json or {}
+        if isinstance(snap, dict):
+            p = _extract_progress_pct(data, snap)
+            if p is not None:
+                snap2 = dict(snap)
+                snap2["last_progress_pct"] = float(p)
+                job.spool_binding_snapshot_json = snap2
+
     elif ev.type == "PrintEnded":
         job.status = "ended"
         job.ended_at = ev.occurred_at
 
     elif ev.type == "PrintFailed":
-        job.status = "failed"
+        # Some firmwares report cancellation as "PrintFailed" with gcode_state=CANCELED.
+        if isinstance(gcode_state, str) and gcode_state in {"CANCELED", "CANCELLED"}:
+            job.status = "cancelled"
+        else:
+            job.status = "failed"
         job.ended_at = ev.occurred_at
 
-    # 结算：只要 job 进入 ended/failed 就尝试一次（避免采集端重启导致漏发 PrintEnded）
-    if job.status in {"ended", "failed"}:
+    # 结算：只要 job 进入 ended/failed/cancelled 就尝试一次
+    if job.status in {"ended", "failed", "cancelled"}:
+        # Default behavior: pre-deduct only, do NOT use AMS remain calibration.
+        if settings.material_ams_calibration_enabled is False:
+            await _finalize_pre_deduct_settlement(session, job=job, data=data, now=_utcnow())
+            return
+
         snap = job.spool_binding_snapshot_json or {}
         if isinstance(snap, dict) and snap.get("settled_at"):
             return

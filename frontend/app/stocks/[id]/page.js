@@ -254,11 +254,11 @@ export default function Page({ params }) {
     if (!voidTarget) return;
     const reason = values.reason ? values.reason : null;
     if (voidTarget.kind === "adjustment") {
-      await fetchJson(`/stocks/${stockId}/ledger/${voidTarget.row.id}/void`, {
+      await fetchJson(`/material-ledger/${voidTarget.row.id}/reverse`, {
         method: "POST",
         body: JSON.stringify({ reason })
       });
-      toast.success("已撤销调整");
+      toast.success("已冲销调整");
     } else if (voidTarget.kind === "manual_stock_consumption") {
       await fetchJson(`/stocks/${stockId}/consumptions/${voidTarget.consumptionId}/void`, {
         method: "POST",
@@ -444,7 +444,7 @@ export default function Page({ params }) {
                     </td>
                     <td className="px-3 py-2">{r.job_id ? <Link className="hover:underline" href={`/jobs/${r.job_id}`}>{String(r.job_id).slice(0, 8)}…</Link> : "-"}</td>
                     <td className="px-3 py-2">
-                      {r.voided_at ? null : r.job_id ? null : (r.kind === "adjustment") ? (
+                      {r.voided_at ? null : (r.kind === "adjustment") ? (
                         <Button
                           variant="destructive"
                           size="sm"
@@ -454,7 +454,7 @@ export default function Page({ params }) {
                             setVoidOpen(true);
                           }}
                         >
-                          撤销
+                          冲销
                         </Button>
                       ) : (r.kind === "consumption" && String(r.note || "").includes("manual_stock")) ? (() => {
                         const cid = parseConsumptionIdFromNote(r.note);

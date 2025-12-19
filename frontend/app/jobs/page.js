@@ -68,8 +68,9 @@ export default function Page() {
   function statusVariant(st) {
     const s = String(st || "").toLowerCase();
     if (s === "running") return "default";
-    if (s === "finished" || s === "finish") return "secondary";
+    if (s === "ended" || s === "finished" || s === "finish") return "secondary";
     if (s === "failed") return "destructive";
+    if (s === "cancelled" || s === "canceled" || s === "cancel") return "outline";
     return "outline";
   }
 
@@ -116,9 +117,9 @@ export default function Page() {
               >
                 <option value="">全部</option>
                 <option value="running">running</option>
-                <option value="finished">finished</option>
+                <option value="ended">ended</option>
                 <option value="failed">failed</option>
-                <option value="idle">idle</option>
+                <option value="cancelled">cancelled</option>
               </select>
             </div>
             <div className="grid gap-2 md:col-span-2">

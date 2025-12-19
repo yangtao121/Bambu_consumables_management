@@ -25,8 +25,9 @@ function fmtTime(iso) {
 function statusVariant(st) {
   const s = String(st || "").toLowerCase();
   if (s === "running") return "default";
-  if (s === "finished" || s === "finish") return "secondary";
+  if (s === "ended" || s === "finished" || s === "finish") return "secondary";
   if (s === "failed") return "destructive";
+  if (s === "cancelled" || s === "canceled" || s === "cancel") return "outline";
   return "outline";
 }
 
