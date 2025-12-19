@@ -37,10 +37,18 @@ async def upsert_color_mapping(body: ColorMappingUpsert, db: AsyncSession = Depe
         await db.execute(select(AmsColorMapping).where(AmsColorMapping.color_hex == body.color_hex).limit(1))
     ).scalars().first()
     if existing:
-        existing.color_name = body.color_name
-        existing.updated_at = now
-        await db.commit()
-        await db.refresh(existing)
+        # Color mapping is immutable: once a hex is mapped, it cannot be edited.
+        # Allow idempotent writes only (same color_name).
+        if (existing.color_name or "").strip() != (body.color_name or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "color mapping is immutable for an existing color_hex",
+                    "color_hex": existing.color_hex,
+                    "existing_color_name": existing.color_name,
+                    "requested_color_name": body.color_name,
+                },
+            )
         return existing
 
     m = AmsColorMapping(color_hex=body.color_hex, color_name=body.color_name, created_at=now, updated_at=now)

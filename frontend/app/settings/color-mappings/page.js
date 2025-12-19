@@ -72,8 +72,10 @@ export default function Page() {
 
       <Card>
         <CardHeader>
-          <CardTitle>新增/更新映射</CardTitle>
-          <CardDescription>同一个颜色码再次提交会覆盖颜色名（幂等）。</CardDescription>
+          <CardTitle>新增映射</CardTitle>
+          <CardDescription>
+            颜色码一旦映射后不可修改；重复提交只允许同名幂等写入（用于避免重复点击）。
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <form
@@ -82,7 +84,16 @@ export default function Page() {
               try {
                 await onSubmit(v);
               } catch (e) {
-                toast.error(String(e?.message || e));
+                if (e && e.status === 409) {
+                  const d = e.detail;
+                  if (d && typeof d === "object" && d.color_hex && d.existing_color_name) {
+                    toast.error(`该颜色码已映射且不可修改：${d.color_hex} -> ${d.existing_color_name}`);
+                  } else {
+                    toast.error("该颜色码已映射且不可修改；如需修正请新增另一个颜色码映射。");
+                  }
+                } else {
+                  toast.error(String(e?.message || e));
+                }
               }
             })}
           >

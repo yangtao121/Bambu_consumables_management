@@ -12,7 +12,7 @@ def normalize_color_hex(v: object) -> str:
 
     Accepts:
     - 'FFFFFFFF' / 'FFFFFF' / '#FFFFFF'
-    - 8-hex uses last 6 as RGB
+    - 8-hex supports both RRGGBBAA (Bambu common) and AARRGGBB (some slicers)
     """
     if not isinstance(v, str):
         raise ValueError("color_hex must be a string")
@@ -25,7 +25,16 @@ def normalize_color_hex(v: object) -> str:
     if not is_hex:
         raise ValueError("color_hex must be hex string like FFFFFF/FFFFFFFF")
     if len(hx_u) == 8:
-        hx_u = hx_u[-6:]
+        # Keep consistent with event_processor._normalize_color_to_hex_or_name():
+        # - Bambu commonly uses RRGGBBAA (alpha last), e.g. 8E9089FF -> #8E9089
+        # - Some systems use AARRGGBB (alpha first), e.g. FF8E9089 -> #8E9089
+        if hx_u.endswith(("FF", "00")):
+            hx_u = hx_u[:6]
+        elif hx_u.startswith(("FF", "00")):
+            hx_u = hx_u[-6:]
+        else:
+            # Fallback: assume AARRGGBB-like and use last 6
+            hx_u = hx_u[-6:]
     if len(hx_u) != 6:
         raise ValueError("color_hex must be 6 or 8 hex digits")
     return f"#{hx_u}"

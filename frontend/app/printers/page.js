@@ -87,7 +87,12 @@ export default function Page() {
     const raw = s0.startsWith("#") ? s0.slice(1).trim() : s0;
     const hx = raw.toUpperCase();
     if (!/^[0-9A-F]+$/.test(hx)) return null;
-    if (hx.length === 8) return `#${hx.slice(-6)}`;
+    if (hx.length === 8) {
+      // Keep consistent with backend normalization (supports both RRGGBBAA and AARRGGBB).
+      if (hx.endsWith("FF") || hx.endsWith("00")) return `#${hx.slice(0, 6)}`; // RRGGBBAA
+      if (hx.startsWith("FF") || hx.startsWith("00")) return `#${hx.slice(-6)}`; // AARRGGBB
+      return `#${hx.slice(-6)}`;
+    }
     if (hx.length === 6) return `#${hx}`;
     return null;
   }
@@ -122,7 +127,16 @@ export default function Page() {
       await reloadColorMappings();
       await reloadStocks();
     } catch (e) {
-      toast.error(String(e?.message || e));
+      if (e && e.status === 409) {
+        const d = e.detail;
+        if (d && typeof d === "object" && d.color_hex && d.existing_color_name) {
+          toast.error(`该颜色码已映射且不可修改：${d.color_hex} -> ${d.existing_color_name}`);
+        } else {
+          toast.error("该颜色码已映射且不可修改；如需修正请新增另一个颜色码映射。");
+        }
+      } else {
+        toast.error(String(e?.message || e));
+      }
     } finally {
       setSavingColorHex(null);
     }
