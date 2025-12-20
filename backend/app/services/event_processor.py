@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +16,8 @@ from app.db.models.normalized_event import NormalizedEvent
 from app.db.models.print_job import PrintJob
 from app.services.stock_service import apply_stock_delta
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -114,25 +117,45 @@ def _normalize_color_to_hex_or_name(v: object) -> tuple[str | None, str | None]:
     - If v is 6/8-hex like 'FFFFFF'/'FFFFFFFF' (optionally with '#'), return (color_hex='#RRGGBB', color_name=None)
     - Otherwise treat it as a human color name string and return (None, color_name)
     """
+    logger.debug(f"Normalizing color input: {v}")
+    
     if not isinstance(v, str):
+        logger.debug(f"Color input {v} is not a string, treating as None")
         return (None, None)
+    
     s = v.strip()
     if not s:
+        logger.debug(f"Color input '{v}' is empty after stripping, treating as None")
         return (None, None)
+    
     hx = s[1:].strip() if s.startswith("#") else s
     hx_u = hx.upper()
     is_hex = all(c in "0123456789ABCDEF" for c in hx_u)
+    
     if is_hex and len(hx_u) == 8:
         # Bambu tray_color is commonly RRGGBBAA (alpha last), e.g. '8E9089FF'.
         # Some systems use AARRGGBB. Use simple heuristics to support both.
         if hx_u.endswith(("FF", "00")):
-            return (f"#{hx_u[:6]}", None)
+            result = (f"#{hx_u[:6]}", None)
+            logger.debug(f"Color '{v}' normalized to {result} (RRGGBBAA format)")
+            return result
         if hx_u.startswith(("FF", "00")):
-            return (f"#{hx_u[-6:]}", None)
-        return (f"#{hx_u[-6:]}", None)
+            result = (f"#{hx_u[-6:]}", None)
+            logger.debug(f"Color '{v}' normalized to {result} (AARRGGBB format)")
+            return result
+        result = (f"#{hx_u[-6:]}", None)
+        logger.debug(f"Color '{v}' normalized to {result} (fallback 8-hex)")
+        return result
+    
     if is_hex and len(hx_u) == 6:
-        return (f"#{hx_u}", None)
-    return (None, s)
+        result = (f"#{hx_u}", None)
+        logger.debug(f"Color '{v}' normalized to {result} (RRGGBB format)")
+        return result
+    
+    # If we get here, it's not a recognized hex format, treat as color name
+    result = (None, s)
+    logger.debug(f"Color '{v}' not recognized as hex format, treating as color name: {result}")
+    return result
 
 
 def _is_official_tray(t: dict) -> bool:
@@ -189,46 +212,97 @@ async def _hydrate_tray_color_names(session: AsyncSession, tm: dict) -> dict:
     Fill meta['color'] from persisted mapping by meta['color_hex'] when possible.
     Returns a shallow-copied dict to avoid mutating JSONB snapshots in-place.
     """
+    logger.debug(f"Hydrating tray color names for {len(tm or {})} trays")
+    
     out: dict = {}
     for k, v in (tm or {}).items():
         if not isinstance(v, dict):
             out[k] = v
             continue
+        
         meta = dict(v)
-        if not meta.get("color") and isinstance(meta.get("color_hex"), str) and meta["color_hex"].startswith("#"):
+        tray_id = k
+        material = meta.get("material")
+        color_hex = meta.get("color_hex")
+        existing_color = meta.get("color")
+        
+        logger.debug(f"Processing tray {tray_id}: material={material}, color_hex={color_hex}, existing_color={existing_color}")
+        
+        if not existing_color and isinstance(color_hex, str) and color_hex.startswith("#"):
             name = await session.scalar(
-                select(AmsColorMapping.color_name).where(AmsColorMapping.color_hex == meta["color_hex"]).limit(1)
+                select(AmsColorMapping.color_name).where(AmsColorMapping.color_hex == color_hex).limit(1)
             )
             if isinstance(name, str) and name.strip():
                 meta["color"] = name.strip()
+                logger.debug(f"Mapped tray {tray_id}: color_hex={color_hex} -> color_name={name.strip()}")
+            else:
+                logger.warning(f"No color mapping found for tray {tray_id} with color_hex={color_hex}")
+        
         out[k] = meta
+    
+    logger.debug(f"Completed hydrating tray color names")
     return out
 
 
 async def _resolve_stock_id(session: AsyncSession, *, material: str | None, color: str | None, is_official: bool) -> uuid.UUID | None:
     if not material or not color:
+        logger.debug(f"Cannot resolve stock: missing material ({material}) or color ({color})")
         return None
+    
+    logger.debug(f"Resolving stock for material={material}, color={color}, is_official={is_official}")
+    
     if is_official:
         rows = (
             await session.execute(
                 select(MaterialStock).where(
-                    MaterialStock.material == material, MaterialStock.color == color, MaterialStock.brand == _OFFICIAL_BRAND
+                    MaterialStock.material == material, 
+                    MaterialStock.color == color, 
+                    MaterialStock.brand == _OFFICIAL_BRAND
                 )
             )
         ).scalars().all()
+        
         if len(rows) == 1:
-            return rows[0].id
+            stock = rows[0]
+            logger.debug(f"Found unique official stock match: id={stock.id}, material={stock.material}, color={stock.color}, brand={stock.brand}")
+            return stock.id
+        
+        if len(rows) > 1:
+            logger.warning(f"Multiple official stock matches found for material={material}, color={color}, brand={_OFFICIAL_BRAND}. Selecting the most recently updated one.")
+            # Sort by updated_at desc, pick the first
+            sorted_rows = sorted(rows, key=lambda x: x.updated_at or datetime.min, reverse=True)
+            stock = sorted_rows[0]
+            logger.debug(f"Selected official stock: id={stock.id}, material={stock.material}, color={stock.color}, brand={stock.brand}, updated_at={stock.updated_at}")
+            return stock.id
+        
+        logger.debug(f"No official stock match found for material={material}, color={color}, brand={_OFFICIAL_BRAND}")
         return None
+    
     # third-party: brand unknown; only auto-resolve when unique under same material+color
     rows = (
         await session.execute(
             select(MaterialStock).where(
-                MaterialStock.material == material, MaterialStock.color == color, MaterialStock.brand != _OFFICIAL_BRAND
+                MaterialStock.material == material, 
+                MaterialStock.color == color, 
+                MaterialStock.brand != _OFFICIAL_BRAND
             )
         )
     ).scalars().all()
+    
     if len(rows) == 1:
-        return rows[0].id
+        stock = rows[0]
+        logger.debug(f"Found unique third-party stock match: id={stock.id}, material={stock.material}, color={stock.color}, brand={stock.brand}")
+        return stock.id
+    
+    if len(rows) > 1:
+        logger.warning(f"Multiple third-party stock matches found for material={material}, color={color}. Selecting the most recently updated one.")
+        # Sort by updated_at desc, pick the first
+        sorted_rows = sorted(rows, key=lambda x: x.updated_at or datetime.min, reverse=True)
+        stock = sorted_rows[0]
+        logger.debug(f"Selected third-party stock: id={stock.id}, material={stock.material}, color={stock.color}, brand={stock.brand}, updated_at={stock.updated_at}")
+        return stock.id
+    
+    logger.debug(f"No third-party stock match found for material={material}, color={color}")
     return None
 
 
@@ -1152,12 +1226,17 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
 
             stock_uuid: uuid.UUID | None = None
             if meta.get("color"):
+                logger.debug(f"Resolving stock for tray {tray_id} with material={meta.get('material')}, color={meta.get('color')}, is_official={meta.get('is_official')}")
                 stock_uuid = await _resolve_stock_id(
                     session,
                     material=meta.get("material"),
                     color=meta.get("color"),
                     is_official=bool(meta.get("is_official")),
                 )
+                if stock_uuid:
+                    logger.debug(f"Resolved stock_uuid={stock_uuid} for tray {tray_id}")
+                else:
+                    logger.warning(f"Failed to resolve stock for tray {tray_id} with material={meta.get('material')}, color={meta.get('color')}")
 
             if stock_uuid is None:
                 # Pending attribution for this tray (one record per tray; segment_idx fixed at 0)
@@ -1196,7 +1275,16 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
 
             stock = await session.get(MaterialStock, stock_uuid)
             if not stock:
+                logger.error(f"Stock with UUID {stock_uuid} not found for tray {tray_id}")
                 continue
+
+            # Verify that the stock matches the tray material and color
+            if stock.material != meta.get("material") or stock.color != meta.get("color"):
+                logger.warning(
+                    f"Stock mismatch for tray {tray_id}: "
+                    f"stock material={stock.material}, stock color={stock.color}, "
+                    f"tray material={meta.get('material')}, tray color={meta.get('color')}"
+                )
 
             grams_requested = 0
             if unit == "pct":
@@ -1209,6 +1297,13 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             grams_effective = min(int(grams_requested), int(stock.remaining_grams))
             if grams_effective <= 0:
                 continue
+
+            logger.info(
+                f"Deducting material for job {job.id}, tray {tray_id}, segment {segment_idx}: "
+                f"material={stock.material}, color={stock.color}, brand={stock.brand}, "
+                f"grams_requested={grams_requested}, grams_effective={grams_effective}, "
+                f"source={source}, stock_uuid={stock_uuid}"
+            )
 
             await apply_stock_delta(
                 session,
@@ -1234,6 +1329,10 @@ async def process_event(session: AsyncSession, ev: NormalizedEvent) -> None:
             )
             session.add(c)
             await session.flush()
+            
+            logger.info(
+                f"Consumption record created: id={c.id}, stock_id={c.stock_id}, material={stock.material}, color={stock.color}, grams={c.grams}"
+            )
 
         # Persist any snapshot updates (tray_to_stock/pending_consumptions)
         snap2 = dict(snap)

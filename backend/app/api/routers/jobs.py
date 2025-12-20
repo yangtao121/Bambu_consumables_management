@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -14,6 +15,8 @@ from app.db.models.print_job import PrintJob
 from app.db.models.spool import Spool
 from app.schemas.job import JobConsumptionOut, JobMaterialResolve, JobOut, ManualConsumptionCreate, ManualConsumptionVoid
 from app.services.stock_service import apply_stock_delta
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -207,25 +210,35 @@ async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: Asyn
 
         st = await db.get(MaterialStock, stock_id)
         if not st:
+            logger.error(f"Stock with ID {stock_id} not found for tray {tray_id_int}")
             remaining_pending.append(entry)
             continue
+
+        # Log the material details for debugging
+        logger.debug(
+            f"Resolving material for job {job_id}, tray {tray_id_int}: "
+            f"stock_id={stock_id}, material={st.material}, color={st.color}, brand={st.brand}"
+        )
 
         unit = entry.get("unit")
         grams_requested = 0
         if unit == "grams":
             try:
                 grams_requested = int(entry.get("grams_requested") or entry.get("grams") or 0)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Error parsing grams for tray {tray_id_int}: {e}")
                 grams_requested = 0
         elif unit == "pct":
             try:
                 pct_delta = float(entry.get("pct_delta") or 0.0)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Error parsing percentage for tray {tray_id_int}: {e}")
                 pct_delta = 0.0
             grams_requested = int(round((pct_delta / 100.0) * float(st.roll_weight_grams)))
 
         if grams_requested <= 0:
             # nothing to settle; drop it
+            logger.debug(f"No grams to deduct for tray {tray_id_int}, grams_requested={grams_requested}")
             resolved_count += 1
             continue
 
@@ -238,13 +251,22 @@ async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: Asyn
             )
         )
         if exists:
+            logger.debug(f"Consumption record already exists for job {job_id}, tray {tray_id_int}, segment {segment_idx}")
             resolved_count += 1
             continue
 
         grams_effective = min(int(grams_requested), int(st.remaining_grams))
         if grams_effective <= 0:
+            logger.debug(f"No effective grams to deduct for tray {tray_id_int}, grams_effective={grams_effective}")
             resolved_count += 1
             continue
+
+        logger.info(
+            f"Deducting material for job {job_id}, tray {tray_id_int}, segment {segment_idx}: "
+            f"material={st.material}, color={st.color}, brand={st.brand}, "
+            f"grams_requested={grams_requested}, grams_effective={grams_effective}, "
+            f"source={entry.get('source')}, stock_id={stock_id}"
+        )
 
         await apply_stock_delta(
             db,
@@ -270,6 +292,11 @@ async def resolve_job_materials(job_id: UUID, body: JobMaterialResolve, db: Asyn
         )
         db.add(c)
         await db.flush()
+
+        logger.info(
+            f"Consumption record created: job_id={job_id}, tray_id={tray_id_int}, "
+            f"stock_id={stock_id}, material={st.material}, color={st.color}, grams={grams_effective}"
+        )
 
         tray_to_stock[str(tray_id_int)] = str(stock_id)
         resolved_count += 1
