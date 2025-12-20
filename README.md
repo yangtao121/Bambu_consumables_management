@@ -65,18 +65,24 @@
    wget https://raw.githubusercontent.com/yangtao121/3d-consumables-management/main/env.ghcr.example -O .env
    ```
 
+   **快速部署选项**：如果您使用的是默认配置，可以直接使用以下命令一键部署：
+   ```bash
+   # 创建并启动服务
+   curl -fsSL https://raw.githubusercontent.com/yangtao121/3d-consumables-management/main/docker-compose.ghcr.yml | docker compose -f - up -d
+   ```
+
 2. **配置环境变量**
    
    编辑 `.env` 文件，至少修改以下关键配置：
    ```bash
-   # 修改为你的GitHub用户名或组织名
-   IMAGE_OWNER=your-username
-   
    # 设置安全密钥
    APP_SECRET_KEY=your-secure-secret-key
    
    # 设置前端访问地址（替换为你的服务器IP）
    NEXT_PUBLIC_API_BASE_URL=http://your-server-ip:8000
+   
+   # 可选：指定镜像版本（默认使用latest）
+   IMAGE_TAG=latest
    ```
 
 3. **拉取并启动服务**
@@ -107,7 +113,7 @@
 - 采集器服务：`ghcr.io/yangtao121/3d-consumables-collector:latest`
 - 前端服务：`ghcr.io/yangtao121/3d-consumables-frontend:latest`
 
-如需使用特定版本，可修改 `.env` 文件中的 `IMAGE_TAG` 变量，例如 `IMAGE_TAG=v1.0.0`。
+所有镜像固定来源于 ghcr.io/yangtao121，无需额外配置。如需使用特定版本，可修改 `.env` 文件中的 `IMAGE_TAG` 变量，例如 `IMAGE_TAG=v1.0.0`。
 
 ### 常用运维命令
 
@@ -126,3 +132,7 @@ docker compose -f docker-compose.ghcr.yml down
 docker compose -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.ghcr.yml up -d
 ```
+
+### 更多信息
+
+详细的GHCR部署指南和故障排除请参考 [GHCR快速部署指南](docs/GHCR快速部署指南.md)。

@@ -19,7 +19,7 @@ services:
       retries: 30
 
   api:
-    image: ${REGISTRY:-ghcr.io}/${IMAGE_OWNER:-your-username}/3d-consumables-api:${IMAGE_TAG:-latest}
+    image: ghcr.io/yangtao121/3d-consumables-api:${IMAGE_TAG:-latest}
     environment:
       APP_ENV: ${APP_ENV:-prod}
       APP_SECRET_KEY: ${APP_SECRET_KEY:-change-me}
@@ -47,7 +47,7 @@ services:
       retries: 30
 
   collector:
-    image: ${REGISTRY:-ghcr.io}/${IMAGE_OWNER:-your-username}/3d-consumables-collector:${IMAGE_TAG:-latest}
+    image: ghcr.io/yangtao121/3d-consumables-collector:${IMAGE_TAG:-latest}
     environment:
       APP_ENV: ${APP_ENV:-prod}
       APP_SECRET_KEY: ${APP_SECRET_KEY:-change-me}
@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: ${REGISTRY:-ghcr.io}/${IMAGE_OWNER:-your-username}/3d-consumables-frontend:${IMAGE_TAG:-latest}
+    image: ghcr.io/yangtao121/3d-consumables-frontend:${IMAGE_TAG:-latest}
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:${API_PORT:-8000}}
     depends_on:
