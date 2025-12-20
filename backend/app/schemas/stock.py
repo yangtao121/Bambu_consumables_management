@@ -50,6 +50,7 @@ class StockOut(APIModel):
     archived_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+    color_hex: str | None = None  # 关联的AMS颜色码，如果没有则为None
 
 
 class StockCreateResult(APIModel):

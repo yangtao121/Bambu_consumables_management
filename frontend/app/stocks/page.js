@@ -11,6 +11,7 @@ import { ApiError, fetchJson } from "../../lib/api";
 import { Button } from "../../components/ui/button";
 import { Badge } from "../../components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../../components/ui/card";
+import { ColorBlock } from "../../components/ui/color-block";
 import {
   Dialog,
   DialogContent,
@@ -73,6 +74,10 @@ export default function Page() {
   const [deleteRefInfo, setDeleteRefInfo] = useState(null);
   const [deleting, setDeleting] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
+  const [bindColorOpen, setBindColorOpen] = useState(false);
+  const [bindColorTarget, setBindColorTarget] = useState(null);
+  const [colorHexInput, setColorHexInput] = useState("");
+  const [binding, setBinding] = useState(false);
   const [colorQuery, setColorQuery] = useState("");
   const [sortKey, setSortKey] = useState("remaining"); // remaining | created | updated
   const [sortDir, setSortDir] = useState("desc"); // asc | desc
@@ -281,6 +286,35 @@ export default function Page() {
     }
   }
 
+  async function bindColor() {
+    if (!bindColorTarget?.id || !colorHexInput.trim()) return;
+    
+    // 验证颜色码格式
+    const hexPattern = /^([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/;
+    const cleanHex = colorHexInput.replace(/^#/, '');
+    
+    if (!hexPattern.test(cleanHex)) {
+      toast.error("请输入有效的颜色码（6位或8位十六进制）");
+      return;
+    }
+    
+    setBinding(true);
+    try {
+      await fetchJson(`/stocks/${bindColorTarget.id}/bind-color?color_hex=${encodeURIComponent(cleanHex)}`, {
+        method: "POST"
+      });
+      toast.success("颜色绑定成功");
+      setBindColorOpen(false);
+      setBindColorTarget(null);
+      setColorHexInput("");
+      await reload();
+    } catch (e) {
+      toast.error(String(e?.message || e));
+    } finally {
+      setBinding(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-end justify-between gap-4">
@@ -442,7 +476,7 @@ export default function Page() {
                   <th className="px-3 py-2">库存项</th>
                   <th className="px-3 py-2">单卷</th>
                   <th className="px-3 py-2">剩余</th>
-                  <th className="px-3 py-2">价值（购入/消耗/剩余）</th>
+                  <th className="px-3 py-2">颜色</th>
                   <th className="px-3 py-2">已消耗（卷）</th>
                   <th className="px-3 py-2">更新时间</th>
                   <th className="px-3 py-2">操作</th>
@@ -465,7 +499,23 @@ export default function Page() {
                     <td className="px-3 py-2">{s.roll_weight_grams}g</td>
                     <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
                     <td className="px-3 py-2">
-                      {pv === null && cv === null && rv === null ? "-" : `${fmtMoney(pv)} / ${fmtMoney(cv)} / ${fmtMoney(rv)}`}
+                      {s.color_hex ? (
+                        <ColorBlock colorHex={s.color_hex} colorName={s.color} />
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <span className="text-muted-foreground">未绑定颜色</span>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              setBindColorTarget(s);
+                              setBindColorOpen(true);
+                            }}
+                          >
+                            绑定颜色
+                          </Button>
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2">{cr === null ? "-" : round2(cr)}</td>
                     <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
@@ -513,7 +563,11 @@ export default function Page() {
                         <td className="px-3 py-2">{s.roll_weight_grams}g</td>
                         <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
                         <td className="px-3 py-2">
-                          {pv === null && cv === null && rv === null ? "-" : `${fmtMoney(pv)} / ${fmtMoney(cv)} / ${fmtMoney(rv)}`}
+                          {s.color_hex ? (
+                            <ColorBlock colorHex={s.color_hex} colorName={s.color} />
+                          ) : (
+                            <span className="text-muted-foreground">未绑定颜色</span>
+                          )}
                         </td>
                         <td className="px-3 py-2">{cr === null ? "-" : round2(cr)}</td>
                         <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
@@ -772,6 +826,54 @@ export default function Page() {
                 {deleting ? "处理中…" : "删除"}
               </Button>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={bindColorOpen}
+        onOpenChange={(v) => {
+          setBindColorOpen(v);
+          if (!v) {
+            setBindColorTarget(null);
+            setColorHexInput("");
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>绑定颜色</DialogTitle>
+            <DialogDescription>
+              为库存项绑定AMS颜色码。颜色码格式为6位或8位十六进制，如FFFFFFFF表示白色。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="text-sm">
+            库存项：{" "}
+            <span className="font-medium">
+              {bindColorTarget ? `${bindColorTarget.material} · ${bindColorTarget.color} · ${bindColorTarget.brand}` : "-"}
+            </span>
+          </div>
+          <div className="grid gap-2">
+            <Label>颜色码 *</Label>
+            <Input
+              placeholder="例如：FFFFFFFF（白色）"
+              value={colorHexInput}
+              onChange={(e) => setColorHexInput(e.target.value)}
+            />
+            {colorHexInput && (
+              <div className="flex items-center gap-2 mt-2">
+                <span>预览：</span>
+                <ColorBlock colorHex={colorHexInput} colorName={bindColorTarget?.color || "预览"} />
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setBindColorOpen(false)} disabled={binding}>
+              取消
+            </Button>
+            <Button type="button" onClick={bindColor} disabled={binding || !colorHexInput.trim()}>
+              {binding ? "绑定中…" : "绑定"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

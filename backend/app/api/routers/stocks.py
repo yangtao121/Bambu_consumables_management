@@ -9,8 +9,10 @@ from sqlalchemy import Text, cast, func, literal_column, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.api.deps import get_db
+from app.db.models.ams_color_mapping import AmsColorMapping
 from app.db.models.consumption_record import ConsumptionRecord
 from app.db.models.material_ledger import MaterialLedger
 from app.db.models.material_stock import MaterialStock
@@ -47,7 +49,12 @@ async def list_stocks(
     brand: str | None = Query(default=None),
     include_archived: bool = Query(default=False, description="Include archived (soft-deleted) stocks"),
     db: AsyncSession = Depends(get_db),
-) -> list[MaterialStock]:
+) -> list[dict]:
+    # 查询所有颜色映射，创建颜色名称到颜色码的映射
+    color_mappings = (await db.execute(select(AmsColorMapping))).scalars().all()
+    color_name_to_hex = {mapping.color_name: mapping.color_hex for mapping in color_mappings}
+    
+    # 查询库存
     stmt = select(MaterialStock)
     if not include_archived:
         stmt = stmt.where(MaterialStock.is_archived.is_(False))
@@ -58,7 +65,27 @@ async def list_stocks(
     if brand:
         stmt = stmt.where(MaterialStock.brand == brand)
     stmt = stmt.order_by(MaterialStock.updated_at.desc(), MaterialStock.created_at.desc())
-    return (await db.execute(stmt)).scalars().all()
+    stocks = (await db.execute(stmt)).scalars().all()
+    
+    # 构建返回结果，添加color_hex字段
+    result = []
+    for stock in stocks:
+        stock_dict = {
+            "id": stock.id,
+            "material": stock.material,
+            "color": stock.color,
+            "brand": stock.brand,
+            "roll_weight_grams": stock.roll_weight_grams,
+            "remaining_grams": stock.remaining_grams,
+            "is_archived": stock.is_archived,
+            "archived_at": stock.archived_at,
+            "created_at": stock.created_at,
+            "updated_at": stock.updated_at,
+            "color_hex": color_name_to_hex.get(stock.color)  # 根据颜色名称查找对应的颜色码
+        }
+        result.append(stock_dict)
+    
+    return result
 
 
 @router.get("/valuations")
@@ -241,11 +268,30 @@ async def create_stock(body: StockCreate, db: AsyncSession = Depends(get_db)) ->
 
 
 @router.get("/{stock_id}", response_model=StockOut)
-async def get_stock(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> MaterialStock:
+async def get_stock(stock_id: UUID, db: AsyncSession = Depends(get_db)) -> dict:
     s = await db.get(MaterialStock, stock_id)
     if not s:
         raise HTTPException(status_code=404, detail="stock not found")
-    return s
+    
+    # 查询颜色映射
+    color_mapping = (
+        await db.execute(select(AmsColorMapping).where(AmsColorMapping.color_name == s.color))
+    ).scalars().first()
+    
+    # 构建返回结果，添加color_hex字段
+    return {
+        "id": s.id,
+        "material": s.material,
+        "color": s.color,
+        "brand": s.brand,
+        "roll_weight_grams": s.roll_weight_grams,
+        "remaining_grams": s.remaining_grams,
+        "is_archived": s.is_archived,
+        "archived_at": s.archived_at,
+        "created_at": s.created_at,
+        "updated_at": s.updated_at,
+        "color_hex": color_mapping.color_hex if color_mapping else None
+    }
 
 
 @router.patch("/{stock_id}", response_model=StockOut)
@@ -679,4 +725,70 @@ async def void_stock_ledger_row(
     )
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/{stock_id}/bind-color")
+async def bind_color_to_stock(
+    stock_id: UUID,
+    color_hex: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    将颜色码绑定到库存项
+    
+    如果颜色码已存在映射，则直接使用
+    如果颜色码不存在，则创建新的映射
+    """
+    from app.schemas.color_mapping import normalize_color_hex
+    
+    # 验证库存项存在
+    stock = await db.get(MaterialStock, stock_id)
+    if not stock:
+        raise HTTPException(status_code=404, detail="stock not found")
+    
+    # 标准化颜色码格式
+    try:
+        normalized_hex = normalize_color_hex(color_hex)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid color hex: {str(e)}")
+    
+    # 查找现有颜色映射
+    existing_mapping = (
+        await db.execute(select(AmsColorMapping).where(AmsColorMapping.color_hex == normalized_hex))
+    ).scalars().first()
+    
+    if not existing_mapping:
+        # 创建新的颜色映射
+        now = datetime.now(timezone.utc)
+        new_mapping = AmsColorMapping(
+            color_hex=normalized_hex,
+            color_name=stock.color,  # 使用库存项的颜色名称
+            created_at=now,
+            updated_at=now
+        )
+        db.add(new_mapping)
+        try:
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=f"Failed to create color mapping: {str(e)}")
+        await db.refresh(new_mapping)
+    else:
+        # 检查颜色名称是否匹配，如果不匹配，更新颜色名称
+        if existing_mapping.color_name != stock.color:
+            existing_mapping.color_name = stock.color
+            existing_mapping.updated_at = datetime.now(timezone.utc)
+            try:
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                raise HTTPException(status_code=400, detail=f"Failed to update color mapping: {str(e)}")
+    
+    return {
+        "ok": True,
+        "stock_id": str(stock_id),
+        "color_hex": normalized_hex,
+        "color_name": stock.color,
+        "message": "颜色绑定成功"
+    }
 
