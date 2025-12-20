@@ -215,7 +215,7 @@ export default function Page({ params }) {
         <div>
           <div className="text-sm text-muted-foreground">
             <Link className="hover:underline" href="/jobs">
-              Jobs
+              任务历史
             </Link>{" "}
             / 详情
           </div>
@@ -248,7 +248,7 @@ export default function Page({ params }) {
         </Card>
         <Card>
           <CardHeader>
-            <CardTitle>Printer</CardTitle>
+            <CardTitle>打印机</CardTitle>
             <CardDescription>关联打印机 ID（后续可增强为别名显示）。</CardDescription>
           </CardHeader>
           <CardContent>
@@ -291,7 +291,7 @@ export default function Page({ params }) {
                   const needsMapping = Boolean(entry?.material && colorHex && !colorName);
                   return (
                     <div key={trayId} className="grid grid-cols-1 gap-2 md:grid-cols-12 md:items-center">
-                      <div className="md:col-span-2 font-medium">Tray {trayId}</div>
+                      <div className="md:col-span-2 font-medium">托盘 {trayId}</div>
                       <div className="md:col-span-4 text-sm text-muted-foreground">
                         {entry ? `${entry.material || "-"} · ${colorDisplay} ${entry.is_official ? "（拓竹）" : ""}` : "-"}
                         {entry?.unit === "pct" && entry?.pct_delta != null ? ` · 消耗 ${Number(entry.pct_delta).toFixed(1)}%` : ""}
@@ -324,7 +324,7 @@ export default function Page({ params }) {
                           onChange={(e) => setResolveMap((prev) => ({ ...prev, [trayId]: e.target.value }))}
                           disabled={needsMapping}
                         >
-                          <option value="">选择库存项…</option>
+                          <option value="">选择库存项...</option>
                           {(opts.length ? opts : stocks).map((s) => (
                             <option key={s.id} value={s.id}>
                               {s.material}/{s.color}/{s.brand}
@@ -366,13 +366,13 @@ export default function Page({ params }) {
                             {c.material} · {c.color} · {c.brand}
                           </Link>
                           <div className="text-xs text-muted-foreground">
-                            {c.tray_id != null ? `Tray ${c.tray_id}` : "-"}
+                            {c.tray_id != null ? `托盘 ${c.tray_id}` : "-"}
                           </div>
                         </>
                       ) : c.spool_id ? (
                         <>
                           <Link className="font-medium hover:underline" href={`/spools/${c.spool_id}`}>
-                            {c.spool_name || "Spool"}
+                            {c.spool_name || "料卷"}
                           </Link>
                           <div className="text-xs text-muted-foreground">
                             {c.spool_material} · {c.spool_color}
@@ -443,7 +443,7 @@ export default function Page({ params }) {
             <div className="grid gap-2">
               <Label>库存项</Label>
               <select className="h-9 rounded-md border border-input bg-background px-3 text-sm" {...form.register("stock_id")}>
-                <option value="">请选择…</option>
+                <option value="">请选择...</option>
                 {stocks.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.material}/{s.color}/{s.brand}

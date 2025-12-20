@@ -6,7 +6,7 @@ import { AppShell } from "../components/app-shell";
 
 export const metadata = {
   title: "耗材管理系统",
-  description: "拓竹耗材管理系统（LAN MQTT）"
+  description: "拓竹耗材管理系统（局域网 MQTT）"
 };
 
 export default function RootLayout({ children }) {

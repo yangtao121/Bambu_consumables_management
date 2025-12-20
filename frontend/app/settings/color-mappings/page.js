@@ -56,7 +56,7 @@ export default function Page() {
         <div>
           <div className="text-sm text-muted-foreground">
             <Link className="hover:underline" href="/settings">
-              Settings
+              设置
             </Link>{" "}
             / 颜色映射
           </div>
@@ -148,7 +148,7 @@ export default function Page() {
                 {items.length === 0 ? (
                   <tr>
                     <td colSpan={3} className="px-3 py-8 text-center text-muted-foreground">
-                      暂无映射。你也可以在 Printers 页面看到未映射颜色并直接保存。
+                      暂无映射。你也可以在打印机页面看到未映射颜色并直接保存。
                     </td>
                   </tr>
                 ) : null}

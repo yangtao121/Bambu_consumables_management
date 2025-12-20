@@ -78,7 +78,7 @@ export default function Page() {
     <div className="space-y-6">
       <div className="flex items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Jobs</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">任务历史</h1>
           <p className="text-sm text-muted-foreground">任务历史：可筛选、查看详情、并手工补录扣料。</p>
         </div>
         <Button variant="outline" onClick={reload} disabled={loading}>
@@ -89,7 +89,7 @@ export default function Page() {
       <Card>
         <CardHeader>
           <CardTitle>筛选</CardTitle>
-          <CardDescription>按打印机/状态筛选，支持文件名/JobKey 搜索。</CardDescription>
+          <CardDescription>按打印机/状态筛选，支持文件名/任务关键字搜索。</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
@@ -116,15 +116,15 @@ export default function Page() {
                 onChange={(e) => setStatus(e.target.value)}
               >
                 <option value="">全部</option>
-                <option value="running">running</option>
-                <option value="ended">ended</option>
-                <option value="failed">failed</option>
-                <option value="cancelled">cancelled</option>
+                <option value="running">运行中</option>
+                <option value="ended">已结束</option>
+                <option value="failed">失败</option>
+                <option value="cancelled">已取消</option>
               </select>
             </div>
             <div className="grid gap-2 md:col-span-2">
               <Label>搜索</Label>
-              <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="文件名 / job_key / 状态" />
+              <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="文件名 / 任务关键字 / 状态" />
             </div>
           </div>
         </CardContent>
@@ -141,8 +141,8 @@ export default function Page() {
               <thead className="bg-muted/50">
                 <tr className="text-left">
                   <th className="px-3 py-2">状态</th>
-                  <th className="px-3 py-2">开始</th>
-                  <th className="px-3 py-2">结束</th>
+                  <th className="px-3 py-2">开始时间</th>
+                  <th className="px-3 py-2">结束时间</th>
                   <th className="px-3 py-2">文件</th>
                   <th className="px-3 py-2">打印机</th>
                 </tr>

@@ -85,7 +85,7 @@ export default function Page() {
         <div>
           <div className="text-sm text-muted-foreground">
             <Link className="hover:underline" href="/settings">
-              Settings
+              设置
             </Link>{" "}
             / 材料调试
           </div>

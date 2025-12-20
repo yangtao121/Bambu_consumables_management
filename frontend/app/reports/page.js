@@ -25,7 +25,7 @@ export default function Page() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <h1 style={{ margin: 0 }}>Reports</h1>
+      <h1 style={{ margin: 0 }}>报告</h1>
       <p style={{ margin: 0, color: "#374151" }}>按日/按月消耗统计（成本仅统计“已计价覆盖”的部分；未计价部分不计入成本）。</p>
       <div style={{ display: "flex", gap: 8 }}>
         <button onClick={reload}>刷新</button>
@@ -38,9 +38,9 @@ export default function Page() {
           <thead>
             <tr style={{ textAlign: "left", borderBottom: "1px solid #e5e7eb" }}>
               <th style={{ padding: 6 }}>日期</th>
-              <th style={{ padding: 6 }}>消耗(g)</th>
+              <th style={{ padding: 6 }}>消耗(克)</th>
               <th style={{ padding: 6 }}>折合成本(元)</th>
-              <th style={{ padding: 6 }}>不可计价(g)</th>
+              <th style={{ padding: 6 }}>不可计价(克)</th>
             </tr>
           </thead>
           <tbody>

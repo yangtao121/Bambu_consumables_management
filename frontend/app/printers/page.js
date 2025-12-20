@@ -273,7 +273,7 @@ export default function Page() {
     <div className="space-y-6">
       <div className="flex items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Printers</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">打印机</h1>
           <p className="text-sm text-muted-foreground">
             添加/查看打印机。耗材不再按“具体卷”绑定托盘，而是按「材质+颜色+品牌」的库存项扣减；第三方品牌读不到时会在作业里提示归因。
           </p>
@@ -294,7 +294,7 @@ export default function Page() {
       <Card>
         <CardHeader>
           <CardTitle>添加打印机</CardTitle>
-          <CardDescription>LAN Code 会在后端加密存储。</CardDescription>
+          <CardDescription>LAN访问码将在后端加密存储。</CardDescription>
         </CardHeader>
         <CardContent>
           <form
@@ -310,28 +310,28 @@ export default function Page() {
             <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
               <div className="grid gap-2">
                 <Label>IP *</Label>
-                <Input placeholder="192.168.x.x" {...form.register("ip")} />
+                <Input placeholder="IP地址，例如：192.168.x.x" {...form.register("ip")} />
                 {form.formState.errors.ip ? <div className="text-xs text-destructive">{form.formState.errors.ip.message}</div> : null}
               </div>
               <div className="grid gap-2">
                 <Label>Serial *</Label>
-                <Input placeholder="A1Pxxxx..." {...form.register("serial")} />
+                <Input placeholder="序列号，例如：A1Pxxxx..." {...form.register("serial")} />
                 {form.formState.errors.serial ? <div className="text-xs text-destructive">{form.formState.errors.serial.message}</div> : null}
               </div>
               <div className="grid gap-2">
                 <Label>LAN Code *</Label>
-                <Input placeholder="LAN Access Code" {...form.register("lan_access_code")} />
+                <Input placeholder="LAN访问码" {...form.register("lan_access_code")} />
                 {form.formState.errors.lan_access_code ? (
                   <div className="text-xs text-destructive">{form.formState.errors.lan_access_code.message}</div>
                 ) : null}
               </div>
               <div className="grid gap-2">
-                <Label>Alias</Label>
-                <Input placeholder="可选" {...form.register("alias")} />
+                <Label>别名</Label>
+                <Input placeholder="别名，可选" {...form.register("alias")} />
               </div>
               <div className="grid gap-2">
-                <Label>Model</Label>
-                <Input placeholder="可选" {...form.register("model")} />
+                <Label>型号</Label>
+                <Input placeholder="型号，可选" {...form.register("model")} />
               </div>
             </div>
             <div>
@@ -393,7 +393,7 @@ export default function Page() {
                       <Badge variant={statusVariant(p.status)}>{p.status}</Badge>
                     </CardTitle>
                     <CardDescription>
-                      {p.ip} · {p.serial} · last_seen {p.last_seen ? fmtTime(p.last_seen) : "-"}
+                      {p.ip} · {p.serial} · 最后连接：{p.last_seen ? fmtTime(p.last_seen) : "-"}
                     </CardDescription>
                   </div>
                   <div className="text-sm">
@@ -401,7 +401,7 @@ export default function Page() {
                     <div className="text-muted-foreground">{progress == null ? "-" : `进度 ${progress}%`}</div>
                     <div className="text-muted-foreground">{taskId ? `${taskId}` : "-"} {taskName ? `· ${taskName}` : ""}</div>
                     <div className="text-muted-foreground">上报：{fmtTime(occurredAt)}</div>
-                    <div className="text-muted-foreground">当前托盘：{trayNow == null || trayNow === 255 ? "-" : `Tray ${trayNow}`}</div>
+                    <div className="text-muted-foreground">当前托盘：{trayNow == null || trayNow === 255 ? "-" : `托盘 ${trayNow}`}</div>
                     <div className="text-muted-foreground">
                       当前耗材：{currentTray ? `${currentMaterial} · ${currentColor}${currentOfficial ? "（拓竹）" : ""}` : "-"}
                     </div>
@@ -426,10 +426,10 @@ export default function Page() {
                   <table className="w-full text-sm">
                     <thead className="bg-muted/50">
                       <tr className="text-left">
-                        <th className="px-3 py-2">Tray</th>
+                        <th className="px-3 py-2">托盘</th>
                         <th className="px-3 py-2">材质</th>
                         <th className="px-3 py-2">颜色</th>
-                        <th className="px-3 py-2">remain(%)</th>
+                        <th className="px-3 py-2">剩余(%)</th>
                         <th className="px-3 py-2">来源</th>
                         <th className="px-3 py-2">库存匹配</th>
                       </tr>
@@ -468,7 +468,7 @@ export default function Page() {
                         return (
                           <tr key={key} className={`border-t ${isActiveTray ? "bg-accent/30" : ""}`}>
                             <td className="px-3 py-2 font-medium">
-                              Tray {trayId} {isActiveTray ? <span className="ml-2 text-xs text-muted-foreground">(正在使用)</span> : null}
+                              托盘 {trayId} {isActiveTray ? <span className="ml-2 text-xs text-muted-foreground">(正在使用)</span> : null}
                             </td>
                             <td className="px-3 py-2">{material}</td>
                             <td className="px-3 py-2">

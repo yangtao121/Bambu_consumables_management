@@ -6,12 +6,12 @@ import { usePathname } from "next/navigation";
 import { cn } from "../lib/utils";
 
 const NAV = [
-  { href: "/", label: "Dashboard" },
-  { href: "/printers", label: "Printers" },
+  { href: "/", label: "仪表盘" },
+  { href: "/printers", label: "打印机" },
   { href: "/stocks", label: "库存" },
-  { href: "/jobs", label: "Jobs" },
-  { href: "/reports", label: "Reports" },
-  { href: "/settings", label: "Settings" }
+  { href: "/jobs", label: "任务历史" },
+  { href: "/reports", label: "报告" },
+  { href: "/settings", label: "设置" }
 ];
 
 function NavLink({ href, label }) {
@@ -43,7 +43,7 @@ export function AppShell({ children }) {
               ))}
             </div>
           </div>
-          <div className="text-xs text-muted-foreground">Docker / LAN MQTT</div>
+          <div className="text-xs text-muted-foreground">Docker / 局域网 MQTT</div>
         </div>
       </div>
 

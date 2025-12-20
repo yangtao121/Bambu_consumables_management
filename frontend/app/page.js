@@ -115,18 +115,18 @@ export default function Page() {
     <div className="space-y-6">
       <div className="flex items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">仪表盘</h1>
           <p className="text-sm text-muted-foreground">概览：在线状态、正在打印、近期消耗趋势与快捷入口。</p>
         </div>
         <div className="flex items-center gap-2">
           <Button asChild variant="outline">
-            <Link href="/printers">去打印机</Link>
+            <Link href="/printers">查看打印机</Link>
           </Button>
           <Button asChild variant="outline">
-            <Link href="/stocks">去库存</Link>
+            <Link href="/stocks">查看库存</Link>
           </Button>
           <Button asChild variant="outline">
-            <Link href="/jobs">去历史</Link>
+            <Link href="/jobs">查看任务历史</Link>
           </Button>
         </div>
       </div>
@@ -146,7 +146,7 @@ export default function Page() {
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-base">正在打印</CardTitle>
-            <CardDescription>RUNNING</CardDescription>
+            <CardDescription>运行中</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="text-3xl font-semibold">{printingPrinters.length}</div>
@@ -178,7 +178,7 @@ export default function Page() {
         <Card>
           <CardHeader>
             <CardTitle>正在打印</CardTitle>
-            <CardDescription>显示当前 RUNNING 的打印机与进度。</CardDescription>
+            <CardDescription>显示当前运行中的打印机与进度。</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="overflow-auto rounded-md border">
@@ -198,7 +198,7 @@ export default function Page() {
                       <td className="px-3 py-2">{progress == null ? "-" : `${progress}%`}</td>
                       <td className="px-3 py-2">{file || "-"}</td>
                       <td className="px-3 py-2">
-                        <Badge>RUNNING</Badge>
+                        <Badge>运行中</Badge>
                       </td>
                     </tr>
                   ))}
