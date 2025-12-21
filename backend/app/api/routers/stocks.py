@@ -5,7 +5,7 @@ import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Text, cast, func, literal_column, select
+from sqlalchemy import Text, cast, func, literal_column, over, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,15 +49,29 @@ async def list_stocks(
     include_archived: bool = Query(default=False, description="Include archived (soft-deleted) stocks"),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
-    # 使用左连接查询库存和颜色映射
+    # 创建子查询，为每个颜色选择最新的映射记录
+    latest_color_mapping = (
+        select(
+            AmsColorMapping.color_name,
+            AmsColorMapping.color_hex,
+            func.row_number().over(
+                partition_by=AmsColorMapping.color_name,
+                order_by=AmsColorMapping.updated_at.desc()
+            ).label('rn')
+        )
+        .subquery()
+    )
+    
+    # 使用左连接查询库存和颜色映射，只选择每个颜色的最新映射
     stmt = (
         select(
             MaterialStock,
-            AmsColorMapping.color_hex
+            latest_color_mapping.c.color_hex
         )
         .outerjoin(
-            AmsColorMapping, 
-            MaterialStock.color == AmsColorMapping.color_name
+            latest_color_mapping, 
+            (MaterialStock.color == latest_color_mapping.c.color_name) & 
+            (latest_color_mapping.c.rn == 1)
         )
     )
     
