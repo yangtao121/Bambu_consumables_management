@@ -23,6 +23,25 @@ import {
 import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 
+// 计算颜色亮度的工具函数
+function getLuminance(hexColor) {
+  // 移除可能的前缀#
+  const hex = hexColor.replace('#', '');
+  
+  // 将十六进制转换为RGB
+  const r = parseInt(hex.substring(0, 2), 16) / 255;
+  const g = parseInt(hex.substring(2, 4), 16) / 255;
+  const b = parseInt(hex.substring(4, 6), 16) / 255;
+  
+  // 使用标准的相对亮度公式
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+// 根据背景颜色亮度确定文字颜色
+function getTextColor(hexColor) {
+  return getLuminance(hexColor) > 0.5 ? '#000000' : '#FFFFFF';
+}
+
 const createSchema = z.object({
   material: z.string().trim().min(1, "请输入材质"),
   color: z.string().trim().min(1, "请输入颜色"),
@@ -452,38 +471,87 @@ export default function Page() {
           <CardDescription>点击进入详情可查看流水并做盘点调整。</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="overflow-auto rounded-md border">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50">
-                <tr className="text-left">
-                  <th className="px-3 py-2">库存项</th>
-                  <th className="px-3 py-2">单卷</th>
-                  <th className="px-3 py-2">剩余</th>
-                  <th className="px-3 py-2">颜色</th>
-                  <th className="px-3 py-2">已消耗（卷）</th>
-                  <th className="px-3 py-2">更新时间</th>
-                  <th className="px-3 py-2">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sortedActiveItems.map((s) => {
-                  const v = s?.id && valuations && valuations.by_stock_id ? valuations.by_stock_id[String(s.id)] : null;
-                  const cr = v && typeof v.consumed_rolls_est === "number" ? v.consumed_rolls_est : null;
-                  return (
-                  <tr key={s.id} className="border-t">
-                    <td className="px-3 py-2">
-                      <Link className="font-medium hover:underline" href={`/stocks/${s.id}`}>
+          {includeArchived && sortedArchivedItems.length > 0 && (
+            <div className="mb-4">
+              <Badge variant="outline" className="bg-muted/30">
+                已归档项（不参与颜色搜索过滤）
+              </Badge>
+            </div>
+          )}
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {/* 活跃库存项 */}
+            {sortedActiveItems.map((s) => (
+              <Card 
+                key={s.id} 
+                className="hover:shadow-md transition-shadow"
+                style={{
+                  backgroundColor: s.color_hex ? `${s.color_hex}20` : undefined,
+                  border: s.color_hex ? `1px solid ${s.color_hex}` : undefined
+                }}
+              >
+                <CardContent 
+                  className="p-4"
+                  style={{
+                    color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                  }}
+                >
+                  <div className="space-y-3">
+                    {/* 库存项名称 */}
+                    <div>
+                      <Link 
+                        className="font-medium hover:underline text-lg" 
+                        href={`/stocks/${s.id}`}
+                        style={{
+                          color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                        }}
+                      >
                         {s.material} · {s.color} · {s.brand}
                       </Link>
-                    </td>
-                    <td className="px-3 py-2">{s.roll_weight_grams}g</td>
-                    <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
-                    <td className="px-3 py-2">
+                    </div>
+                    
+                    {/* 剩余量 */}
+                    <div className="flex justify-between items-center text-sm">
+                      <span 
+                        className="text-muted-foreground"
+                        style={{
+                          color: s.color_hex ? `${getTextColor(s.color_hex)}99` : undefined
+                        }}
+                      >
+                        剩余
+                      </span>
+                      <span 
+                        className="font-medium text-lg"
+                        style={{
+                          color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                        }}
+                      >
+                        {s.remaining_grams}g
+                      </span>
+                    </div>
+                    
+                    {/* 颜色信息 */}
+                    <div className="flex justify-between items-center">
+                      <span 
+                        className="text-sm text-muted-foreground"
+                        style={{
+                          color: s.color_hex ? `${getTextColor(s.color_hex)}99` : undefined
+                        }}
+                      >
+                        颜色
+                      </span>
                       {s.color_hex ? (
                         <ColorBlock colorHex={s.color_hex} colorName={s.color} />
                       ) : (
                         <div className="flex items-center gap-2">
-                          <span className="text-muted-foreground">未绑定颜色</span>
+                          <span 
+                            className="text-xs"
+                            style={{
+                              color: s.color_hex ? `${getTextColor(s.color_hex)}99` : undefined
+                            }}
+                          >
+                            未绑定
+                          </span>
                           <Button
                             variant="outline"
                             size="sm"
@@ -491,103 +559,166 @@ export default function Page() {
                               setBindColorTarget(s);
                               setBindColorOpen(true);
                             }}
+                            style={{
+                              color: s.color_hex ? getTextColor(s.color_hex) : undefined,
+                              borderColor: s.color_hex ? getTextColor(s.color_hex) : undefined
+                            }}
                           >
                             绑定颜色
                           </Button>
                         </div>
                       )}
-                    </td>
-                    <td className="px-3 py-2">{cr === null ? "-" : round2(cr)}</td>
-                    <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
-                    <td className="px-3 py-2">
+                    </div>
+                    
+                    {/* 操作按钮 */}
+                    <div className="pt-2">
                       <Button
                         variant="destructive"
                         size="sm"
+                        className="w-full"
                         disabled={Boolean(s?.is_archived)}
                         onClick={() => {
                           setDeleteTarget(s);
                           setDeleteRefInfo(null);
                           setDeleteOpen(true);
                         }}
+                        style={{
+                          backgroundColor: s.color_hex ? `${getTextColor(s.color_hex)}20` : undefined,
+                          borderColor: s.color_hex ? getTextColor(s.color_hex) : undefined,
+                          color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                        }}
                       >
                         删除
                       </Button>
-                    </td>
-                  </tr>
-                  );
-                })}
-                {includeArchived && sortedArchivedItems.length ? (
-                  <tr className="border-t bg-muted/30">
-                    <td colSpan={7} className="px-3 py-2 text-xs text-muted-foreground">
-                      已归档（不参与颜色搜索过滤）
-                    </td>
-                  </tr>
-                ) : null}
-                {includeArchived
-                  ? sortedArchivedItems.map((s) => {
-                      const v = s?.id && valuations && valuations.by_stock_id ? valuations.by_stock_id[String(s.id)] : null;
-                      const cr = v && typeof v.consumed_rolls_est === "number" ? v.consumed_rolls_est : null;
-                      return (
-                      <tr key={s.id} className="border-t">
-                        <td className="px-3 py-2">
-                          <Link className="font-medium hover:underline" href={`/stocks/${s.id}`}>
-                            {s.material} · {s.color} · {s.brand}
-                          </Link>
-                          <span className="ml-2 align-middle">
-                            <Badge variant="outline">已归档</Badge>
-                          </span>
-                        </td>
-                        <td className="px-3 py-2">{s.roll_weight_grams}g</td>
-                        <td className="px-3 py-2 font-medium">{s.remaining_grams}g</td>
-                        <td className="px-3 py-2">
-                          {s.color_hex ? (
-                            <ColorBlock colorHex={s.color_hex} colorName={s.color} />
-                          ) : (
-                            <span className="text-muted-foreground">未绑定颜色</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2">{cr === null ? "-" : round2(cr)}</td>
-                        <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
-                        <td className="px-3 py-2">
-                          <div className="flex gap-2">
-                            <Button 
-                              variant="default" 
-                              size="sm" 
-                              onClick={() => restoreStock(s)}
-                              disabled={restoring}
-                            >
-                              {restoring ? "恢复中..." : "恢复"}
-                            </Button>
-                            <Button variant="destructive" size="sm" disabled>
-                              删除
-                            </Button>
-                          </div>
-                        </td>
-                      </tr>
-                      );
-                    })
-                  : null}
-                {!includeArchived && sortedActiveItems.length === 0 ? (
-                  <tr>
-                    <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
-                      {colorQuery.trim()
-                        ? "未找到匹配该颜色的未归档库存项。"
-                        : "暂无库存项，请点击右上角“新增库存”。"}
-                    </td>
-                  </tr>
-                ) : null}
-                {includeArchived && sortedActiveItems.length === 0 && sortedArchivedItems.length === 0 ? (
-                  <tr>
-                    <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
-                      {colorQuery.trim()
-                        ? "未找到匹配该颜色的未归档库存项。（归档项不会参与搜索过滤）"
-                        : "暂无库存项，请点击右上角“新增库存”。"}
-                    </td>
-                  </tr>
-                ) : null}
-              </tbody>
-            </table>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+            
+            {/* 归档库存项 */}
+            {includeArchived && sortedArchivedItems.map((s) => (
+              <Card 
+                key={s.id} 
+                className="hover:shadow-md transition-shadow opacity-75"
+                style={{
+                  backgroundColor: s.color_hex ? `${s.color_hex}20` : undefined,
+                  border: s.color_hex ? `1px solid ${s.color_hex}` : undefined
+                }}
+              >
+                <CardContent 
+                  className="p-4"
+                  style={{
+                    color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                  }}
+                >
+                  <div className="space-y-3">
+                    {/* 库存项名称 */}
+                    <div className="flex items-center justify-between">
+                      <Link 
+                        className="font-medium hover:underline text-lg" 
+                        href={`/stocks/${s.id}`}
+                        style={{
+                          color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                        }}
+                      >
+                        {s.material} · {s.color} · {s.brand}
+                      </Link>
+                      <Badge 
+                        variant="outline" 
+                        className="text-xs"
+                        style={{
+                          color: s.color_hex ? getTextColor(s.color_hex) : undefined,
+                          borderColor: s.color_hex ? getTextColor(s.color_hex) : undefined
+                        }}
+                      >
+                        已归档
+                      </Badge>
+                    </div>
+                    
+                    {/* 剩余量 */}
+                    <div className="flex justify-between items-center text-sm">
+                      <span 
+                        className="text-muted-foreground"
+                        style={{
+                          color: s.color_hex ? `${getTextColor(s.color_hex)}99` : undefined
+                        }}
+                      >
+                        剩余
+                      </span>
+                      <span 
+                        className="font-medium text-lg"
+                        style={{
+                          color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                        }}
+                      >
+                        {s.remaining_grams}g
+                      </span>
+                    </div>
+                    
+                    {/* 颜色信息 */}
+                    <div className="flex justify-between items-center">
+                      <span 
+                        className="text-sm text-muted-foreground"
+                        style={{
+                          color: s.color_hex ? `${getTextColor(s.color_hex)}99` : undefined
+                        }}
+                      >
+                        颜色
+                      </span>
+                      {s.color_hex ? (
+                        <ColorBlock colorHex={s.color_hex} colorName={s.color} />
+                      ) : (
+                        <span 
+                          className="text-xs"
+                          style={{
+                            color: s.color_hex ? `${getTextColor(s.color_hex)}99` : undefined
+                          }}
+                        >
+                          未绑定颜色
+                        </span>
+                      )}
+                    </div>
+                    
+                    {/* 操作按钮 */}
+                    <div className="pt-2">
+                      <Button 
+                        variant="default" 
+                        size="sm" 
+                        className="w-full"
+                        onClick={() => restoreStock(s)}
+                        disabled={restoring}
+                        style={{
+                          backgroundColor: s.color_hex ? `${getTextColor(s.color_hex)}20` : undefined,
+                          borderColor: s.color_hex ? getTextColor(s.color_hex) : undefined,
+                          color: s.color_hex ? getTextColor(s.color_hex) : undefined
+                        }}
+                      >
+                        {restoring ? "恢复中..." : "恢复"}
+                      </Button>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
           </div>
+          
+          {/* 空状态提示 */}
+          {!includeArchived && sortedActiveItems.length === 0 && (
+            <div className="text-center py-8 text-muted-foreground">
+              {colorQuery.trim()
+                ? "未找到匹配该颜色的未归档库存项。"
+                : "暂无库存项，请点击右上角\"新增库存\"。"}
+            </div>
+          )}
+          
+          {includeArchived && sortedActiveItems.length === 0 && sortedArchivedItems.length === 0 && (
+            <div className="text-center py-8 text-muted-foreground">
+              {colorQuery.trim()
+                ? "未找到匹配该颜色的未归档库存项。（归档项不会参与搜索过滤）"
+                : "暂无库存项，请点击右上角\"新增库存\"。"}
+            </div>
+          )}
         </CardContent>
       </Card>
 
