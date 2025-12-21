@@ -259,7 +259,7 @@ export default function Page({ params }) {
         body: JSON.stringify({ reason })
       });
       toast.success("已冲销调整");
-    } else if (voidTarget.kind === "manual_stock_consumption") {
+    } else if (voidTarget.kind === "stock_consumption") {
       await fetchJson(`/stocks/${stockId}/consumptions/${voidTarget.consumptionId}/void`, {
         method: "POST",
         body: JSON.stringify({ reason })
@@ -456,7 +456,7 @@ export default function Page({ params }) {
                         >
                           冲销
                         </Button>
-                      ) : (r.kind === "consumption" && String(r.note || "").includes("manual_stock")) ? (() => {
+                      ) : (r.kind === "consumption") ? (() => {
                         const cid = parseConsumptionIdFromNote(r.note);
                         if (!cid) return null;
                         return (
@@ -464,7 +464,7 @@ export default function Page({ params }) {
                             variant="destructive"
                             size="sm"
                             onClick={() => {
-                              setVoidTarget({ kind: "manual_stock_consumption", row: r, consumptionId: cid });
+                              setVoidTarget({ kind: "stock_consumption", row: r, consumptionId: cid });
                               voidForm.reset({ reason: "" });
                               setVoidOpen(true);
                             }}
@@ -744,7 +744,7 @@ export default function Page({ params }) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>撤销记录</DialogTitle>
-            <DialogDescription>撤销会保留审计记录，并写入一条反向流水回滚库存。</DialogDescription>
+            <DialogDescription>撤销会保留审计记录，并写入一条反向流水回滚库存。此操作可用于撤销自动扣料和手动扣料记录。</DialogDescription>
           </DialogHeader>
           <form
             className="grid gap-4"

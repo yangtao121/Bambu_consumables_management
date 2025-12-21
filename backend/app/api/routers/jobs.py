@@ -128,7 +128,7 @@ async def add_manual_consumption(job_id: UUID, body: ManualConsumptionCreate, db
 
 
 @router.post("/{job_id}/consumptions/{consumption_id}/void")
-async def void_manual_job_consumption(
+async def void_job_consumption(
     job_id: UUID,
     consumption_id: UUID,
     body: ManualConsumptionVoid,
@@ -143,10 +143,8 @@ async def void_manual_job_consumption(
         raise HTTPException(status_code=404, detail="consumption not found")
     if getattr(c, "voided_at", None) is not None:
         raise HTTPException(status_code=409, detail="consumption already voided")
-    if str(c.source or "") != "manual":
-        raise HTTPException(status_code=409, detail="only manual consumptions can be voided")
     if c.stock_id is None:
-        raise HTTPException(status_code=409, detail="manual consumption missing stock_id")
+        raise HTTPException(status_code=409, detail="consumption missing stock_id")
 
     grams = int(getattr(c, "grams_effective", None) or getattr(c, "grams") or 0)
     if grams <= 0:
@@ -160,7 +158,7 @@ async def void_manual_job_consumption(
         db,
         c.stock_id,
         +int(grams),
-        reason=f"void manual job={job_id} consumption={consumption_id} note={body.reason or ''}",
+        reason=f"void job={job_id} consumption={consumption_id} source={c.source} note={body.reason or ''}",
         job_id=job_id,
         kind="reversal",
     )
