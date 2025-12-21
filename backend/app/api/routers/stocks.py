@@ -454,6 +454,51 @@ async def archive_stock(
     return {"ok": True, "archived": True, "consumption_count": consumption_count, "job_count": job_count}
 
 
+@router.post("/{stock_id}/restore")
+async def restore_stock(
+    stock_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    s = await db.get(MaterialStock, stock_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="stock not found")
+    
+    # Not archived: nothing to do
+    if not getattr(s, "is_archived", False):
+        return {"ok": True, "already_restored": True}
+    
+    # Check if there's a conflict with existing active stock
+    existing_stock = (
+        await db.execute(
+            select(MaterialStock).where(
+                MaterialStock.material == s.material,
+                MaterialStock.color == s.color,
+                MaterialStock.brand == s.brand,
+                MaterialStock.is_archived.is_(False),
+                MaterialStock.id != stock_id,
+            )
+        )
+    ).scalars().first()
+    
+    if existing_stock:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "stock key conflict with existing active stock",
+                "conflict_stock_id": str(existing_stock.id),
+                "key": {"material": s.material, "color": s.color, "brand": s.brand},
+            },
+        )
+    
+    # Restore the stock
+    now = datetime.now(timezone.utc)
+    s.is_archived = False
+    s.archived_at = None
+    s.updated_at = now
+    await db.commit()
+    return {"ok": True, "restored": True}
+
+
 @router.post("/{stock_id}/adjustments")
 async def create_adjustment(stock_id: UUID, body: StockAdjustmentCreate, db: AsyncSession = Depends(get_db)) -> dict:
     try:

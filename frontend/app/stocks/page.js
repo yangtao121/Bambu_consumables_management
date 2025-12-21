@@ -82,6 +82,7 @@ export default function Page() {
   const [sortKey, setSortKey] = useState("remaining"); // remaining | created | updated
   const [sortDir, setSortDir] = useState("desc"); // asc | desc
   const [lastPriceEdited, setLastPriceEdited] = useState(null); // "per_roll" | "total" | null
+  const [restoring, setRestoring] = useState(false);
 
   const form = useForm({
     resolver: zodResolver(createSchema),
@@ -289,6 +290,26 @@ export default function Page() {
       toast.error(String(e?.message || e));
     } finally {
       setBinding(false);
+    }
+  }
+
+  async function restoreStock(stock) {
+    if (!stock?.id) return;
+    setRestoring(true);
+    try {
+      await fetchJson(`/stocks/${stock.id}/restore`, {
+        method: "POST"
+      });
+      toast.success("库存已恢复");
+      await reload();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409 && e.detail && typeof e.detail === "object") {
+        toast.error(`恢复失败：${e.detail.message || "与现有库存冲突"}`);
+      } else {
+        toast.error(String(e?.message || e));
+      }
+    } finally {
+      setRestoring(false);
     }
   }
 
@@ -528,9 +549,19 @@ export default function Page() {
                         <td className="px-3 py-2">{cr === null ? "-" : round2(cr)}</td>
                         <td className="px-3 py-2">{s.updated_at ? new Date(s.updated_at).toLocaleString() : "-"}</td>
                         <td className="px-3 py-2">
-                          <Button variant="destructive" size="sm" disabled>
-                            删除
-                          </Button>
+                          <div className="flex gap-2">
+                            <Button 
+                              variant="default" 
+                              size="sm" 
+                              onClick={() => restoreStock(s)}
+                              disabled={restoring}
+                            >
+                              {restoring ? "恢复中..." : "恢复"}
+                            </Button>
+                            <Button variant="destructive" size="sm" disabled>
+                              删除
+                            </Button>
+                          </div>
                         </td>
                       </tr>
                       );
