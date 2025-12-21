@@ -9,7 +9,6 @@ from sqlalchemy import Text, cast, func, literal_column, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
 
 from app.api.deps import get_db
 from app.db.models.ams_color_mapping import AmsColorMapping
@@ -50,12 +49,18 @@ async def list_stocks(
     include_archived: bool = Query(default=False, description="Include archived (soft-deleted) stocks"),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
-    # 查询所有颜色映射，创建颜色名称到颜色码的映射
-    color_mappings = (await db.execute(select(AmsColorMapping))).scalars().all()
-    color_name_to_hex = {mapping.color_name: mapping.color_hex for mapping in color_mappings}
+    # 使用左连接查询库存和颜色映射
+    stmt = (
+        select(
+            MaterialStock,
+            AmsColorMapping.color_hex
+        )
+        .outerjoin(
+            AmsColorMapping, 
+            MaterialStock.color == AmsColorMapping.color_name
+        )
+    )
     
-    # 查询库存
-    stmt = select(MaterialStock)
     if not include_archived:
         stmt = stmt.where(MaterialStock.is_archived.is_(False))
     if material:
@@ -64,13 +69,13 @@ async def list_stocks(
         stmt = stmt.where(MaterialStock.color == color)
     if brand:
         stmt = stmt.where(MaterialStock.brand == brand)
-    stmt = stmt.order_by(MaterialStock.updated_at.desc(), MaterialStock.created_at.desc())
-    stocks = (await db.execute(stmt)).scalars().all()
     
-    # 构建返回结果，添加color_hex字段
-    result = []
-    for stock in stocks:
-        stock_dict = {
+    stmt = stmt.order_by(MaterialStock.updated_at.desc(), MaterialStock.created_at.desc())
+    results = (await db.execute(stmt)).all()
+    
+    # 构建返回结果
+    return [
+        {
             "id": stock.id,
             "material": stock.material,
             "color": stock.color,
@@ -81,11 +86,10 @@ async def list_stocks(
             "archived_at": stock.archived_at,
             "created_at": stock.created_at,
             "updated_at": stock.updated_at,
-            "color_hex": color_name_to_hex.get(stock.color)  # 根据颜色名称查找对应的颜色码
+            "color_hex": color_hex  # 直接从连接查询获取
         }
-        result.append(stock_dict)
-    
-    return result
+        for stock, color_hex in results
+    ]
 
 
 @router.get("/valuations")

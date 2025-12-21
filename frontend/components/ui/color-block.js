@@ -12,27 +12,8 @@ import React from "react";
  * @returns {React.Element} 颜色块组件
  */
 export function ColorBlock({ colorHex, colorName, size = 24, showHex = false }) {
-  // 处理颜色码格式，确保以 # 开头且只包含6位十六进制
-  const getNormalizedColor = (hex) => {
-    if (!hex) return "#CCCCCC"; // 默认灰色
-    
-    // 移除 # 前缀
-    let color = hex.startsWith('#') ? hex.substring(1) : hex;
-    
-    // 如果是8位（FFFFFFFF），去掉前两位或后两位的Alpha通道
-    if (color.length === 8) {
-      color = color.substring(0, 6);
-    }
-    
-    // 确保6位长度
-    if (color.length !== 6) {
-      return "#CCCCCC"; // 无效颜色返回默认灰色
-    }
-    
-    return `#${color}`;
-  };
-  
-  const normalizedColor = getNormalizedColor(colorHex);
+  // 显示颜色块，假设后端已经标准化了颜色码格式
+  const normalizedColor = colorHex || "#CCCCCC"; // 如果没有颜色码，使用默认灰色
   
   return (
     <div className="flex items-center gap-2">

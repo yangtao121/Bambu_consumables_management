@@ -139,7 +139,7 @@ export default function Page() {
       const [data, tray, vals] = await Promise.all([
         fetchJson(`/stocks${inc ? "?include_archived=1" : ""}`),
         fetchJson("/trays/summary").catch(() => null),
-        fetchJson(`/stocks/valuations${inc ? "?include_archived=1" : ""}`).catch(() => null)
+        Promise.resolve(null) // 不再需要获取价值数据
       ]);
       setItems(Array.isArray(data) ? data : []);
       setTrayTotal(tray && typeof tray.total_trays === "number" ? tray.total_trays : null);
@@ -207,27 +207,6 @@ export default function Page() {
     () => activeItems.reduce((acc, s) => acc + Number(s.remaining_grams || 0), 0),
     [activeItems]
   );
-  const valuationTotals = useMemo(() => {
-    const t = valuations && typeof valuations === "object" ? valuations.totals : null;
-    if (!t || typeof t !== "object") {
-      return {
-        purchased_value_total: null,
-        consumed_value_est: null,
-        remaining_value_est: null,
-        consumed_rolls_est: null
-      };
-    }
-    return {
-      purchased_value_total: typeof t.purchased_value_total === "number" ? t.purchased_value_total : null,
-      consumed_value_est: typeof t.consumed_value_est === "number" ? t.consumed_value_est : null,
-      remaining_value_est: typeof t.remaining_value_est === "number" ? t.remaining_value_est : null,
-      consumed_rolls_est: typeof t.consumed_rolls_est === "number" ? t.consumed_rolls_est : null
-    };
-  }, [valuations]);
-  const valuationById = useMemo(() => {
-    const m = valuations && typeof valuations === "object" ? valuations.by_stock_id : null;
-    return m && typeof m === "object" ? m : {};
-  }, [valuations]);
 
   async function onSubmit(values) {
     const res = await fetchJson("/stocks", {
@@ -289,12 +268,10 @@ export default function Page() {
   async function bindColor() {
     if (!bindColorTarget?.id || !colorHexInput.trim()) return;
     
-    // 验证颜色码格式
-    const hexPattern = /^([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/;
+    // 简单的格式验证，更详细的验证由后端处理
     const cleanHex = colorHexInput.replace(/^#/, '');
-    
-    if (!hexPattern.test(cleanHex)) {
-      toast.error("请输入有效的颜色码（6位或8位十六进制）");
+    if (!/^[0-9A-Fa-f]{6,8}$/.test(cleanHex)) {
+      toast.error("请输入6位或8位十六进制颜色码");
       return;
     }
     
@@ -412,43 +389,7 @@ export default function Page() {
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
-        <Card>
-          <CardHeader>
-            <CardTitle>累计购入总价值</CardTitle>
-            <CardDescription>所有可计价入库流水累计（元）。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-semibold">
-              {valuationTotals.purchased_value_total === null ? "-" : fmtMoney(valuationTotals.purchased_value_total)}
-            </div>
-            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>已消耗价值</CardTitle>
-            <CardDescription>按移动加权平均估算（仅计已计价部分）。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-semibold">
-              {valuationTotals.consumed_value_est === null ? "-" : fmtMoney(valuationTotals.consumed_value_est)}
-            </div>
-            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>当前剩余价值</CardTitle>
-            <CardDescription>已计价余额的剩余成本估算。</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-semibold">
-              {valuationTotals.remaining_value_est === null ? "-" : fmtMoney(valuationTotals.remaining_value_est)}
-            </div>
-            <div className="mt-2 text-sm text-muted-foreground">单位：元</div>
-          </CardContent>
-        </Card>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>已消耗卷数</CardTitle>
@@ -456,9 +397,30 @@ export default function Page() {
           </CardHeader>
           <CardContent>
             <div className="text-3xl font-semibold">
-              {valuationTotals.consumed_rolls_est === null ? "-" : round2(valuationTotals.consumed_rolls_est)}
+              {valuations && valuations.by_stock_id ? 
+                round2(Object.values(valuations.by_stock_id)
+                  .filter(v => v && typeof v.consumed_rolls_est === "number")
+                  .reduce((sum, v) => sum + v.consumed_rolls_est, 0)) 
+                : "-"}
             </div>
             <div className="mt-2 text-sm text-muted-foreground">单位：卷（估算）</div>
+          </CardContent>
+        </Card>
+        
+        <Card>
+          <CardHeader>
+            <CardTitle>颜色覆盖率</CardTitle>
+            <CardDescription>已绑定颜色的库存项占比。</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-semibold">
+              {activeItems.length > 0 ? 
+                `${Math.round((activeItems.filter(s => s.color_hex).length / activeItems.length) * 100)}%` 
+                : "0%"}
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">
+              已绑定 {activeItems.filter(s => s.color_hex).length} / {activeItems.length} 项
+            </div>
           </CardContent>
         </Card>
       </div>
@@ -484,10 +446,7 @@ export default function Page() {
               </thead>
               <tbody>
                 {sortedActiveItems.map((s) => {
-                  const v = s?.id ? valuationById[String(s.id)] : null;
-                  const pv = v && typeof v.purchased_value_total === "number" ? v.purchased_value_total : null;
-                  const cv = v && typeof v.consumed_value_est === "number" ? v.consumed_value_est : null;
-                  const rv = v && typeof v.remaining_value_est === "number" ? v.remaining_value_est : null;
+                  const v = s?.id && valuations && valuations.by_stock_id ? valuations.by_stock_id[String(s.id)] : null;
                   const cr = v && typeof v.consumed_rolls_est === "number" ? v.consumed_rolls_est : null;
                   return (
                   <tr key={s.id} className="border-t">
@@ -545,10 +504,7 @@ export default function Page() {
                 ) : null}
                 {includeArchived
                   ? sortedArchivedItems.map((s) => {
-                      const v = s?.id ? valuationById[String(s.id)] : null;
-                      const pv = v && typeof v.purchased_value_total === "number" ? v.purchased_value_total : null;
-                      const cv = v && typeof v.consumed_value_est === "number" ? v.consumed_value_est : null;
-                      const rv = v && typeof v.remaining_value_est === "number" ? v.remaining_value_est : null;
+                      const v = s?.id && valuations && valuations.by_stock_id ? valuations.by_stock_id[String(s.id)] : null;
                       const cr = v && typeof v.consumed_rolls_est === "number" ? v.consumed_rolls_est : null;
                       return (
                       <tr key={s.id} className="border-t">
