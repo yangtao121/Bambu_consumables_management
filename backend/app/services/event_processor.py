@@ -257,7 +257,8 @@ async def _resolve_stock_id(session: AsyncSession, *, material: str | None, colo
                 select(MaterialStock).where(
                     MaterialStock.material == material, 
                     MaterialStock.color == color, 
-                    MaterialStock.brand == _OFFICIAL_BRAND
+                    MaterialStock.brand == _OFFICIAL_BRAND,
+                    MaterialStock.is_archived.is_(False)
                 )
             )
         ).scalars().all()
@@ -284,7 +285,8 @@ async def _resolve_stock_id(session: AsyncSession, *, material: str | None, colo
             select(MaterialStock).where(
                 MaterialStock.material == material, 
                 MaterialStock.color == color, 
-                MaterialStock.brand != _OFFICIAL_BRAND
+                MaterialStock.brand != _OFFICIAL_BRAND,
+                MaterialStock.is_archived.is_(False)
             )
         )
     ).scalars().all()
